@@ -6,10 +6,15 @@ describe('plugin exports', () => {
   it('exposes the cordis four-export shape', () => {
     expect(name).toBe('skill-manager')
     expect(typeof apply).toBe('function')
-    expect(Array.isArray(inject)).toBe(true)
+    expect(inject).toEqual(['webServer'])
   })
 
   it('Config is a schemastery schema that parses defaults', () => {
-    expect(Config({})).toEqual({ catalogUrl: 'https://www.skills.sh' })
+    expect(Config({})).toEqual({
+      catalogUrl: 'https://www.skills.sh',
+      githubRawBase: 'https://raw.githubusercontent.com',
+      fetchConcurrency: 5,
+      descriptionCacheMaxEntries: 200,
+    })
   })
 })
