@@ -25,6 +25,8 @@ export interface Config {
   fetchConcurrency: number
   /** Upper bound of cached description outcomes (positive and negative). */
   descriptionCacheMaxEntries: number
+  /** Per-request Source fetch timeout for descriptions, in milliseconds. */
+  descriptionFetchTimeoutMs: number
 }
 
 export const Config = Schema.object({
@@ -40,6 +42,9 @@ export const Config = Schema.object({
   descriptionCacheMaxEntries: Schema.natural()
     .description('Upper bound of cached description outcomes (positive and negative).')
     .default(200),
+  descriptionFetchTimeoutMs: Schema.natural()
+    .description('Per-request Source fetch timeout for descriptions, in milliseconds.')
+    .default(10_000),
 })
 
 /** Plugin-unique route prefix (ADR-0006); every endpoint below hangs off it. */

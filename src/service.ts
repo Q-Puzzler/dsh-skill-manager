@@ -30,6 +30,8 @@ export interface SkillManagerOptions {
   fetchConcurrency: number
   /** Upper bound of cached description outcomes (positive and negative). */
   descriptionCacheMaxEntries: number
+  /** Per-request Source fetch timeout in milliseconds. */
+  descriptionFetchTimeoutMs: number
   fetcher: Fetcher
 }
 
@@ -49,9 +51,6 @@ export const DESCRIPTION_PROBE_PATHS = [
   (skillId: string) => `${skillId}/SKILL.md`,
   () => 'SKILL.md',
 ] as const
-
-/** Per-request Source fetch timeout; long enough for a cold GitHub raw hit. */
-const DESCRIPTION_FETCH_TIMEOUT_MS = 10_000
 
 /** Thrown by search failures; the route maps it to an error response. */
 export class SearchError extends Error {}
@@ -106,6 +105,7 @@ export class SkillManager {
   private readonly catalogUrl: string
   private readonly githubRawBase: string
   private readonly fetcher: Fetcher
+  private readonly fetchTimeoutMs: number
   private readonly semaphore: Semaphore
   private readonly cache: BoundedCache<string | null>
   private readonly pending = new Map<string, Promise<string | null>>()
@@ -114,6 +114,7 @@ export class SkillManager {
     this.catalogUrl = options.catalogUrl.replace(/\/+$/, '')
     this.githubRawBase = options.githubRawBase.replace(/\/+$/, '')
     this.fetcher = options.fetcher
+    this.fetchTimeoutMs = Math.max(1, Math.floor(options.descriptionFetchTimeoutMs))
     this.semaphore = new Semaphore(Math.max(1, Math.floor(options.fetchConcurrency)))
     this.cache = new BoundedCache(Math.max(1, Math.floor(options.descriptionCacheMaxEntries)))
   }
@@ -180,7 +181,7 @@ export class SkillManager {
       const url = `${this.githubRawBase}/${owner}/${repo}/HEAD/${buildPath(skillId)}`
       let response: FetchResult
       try {
-        response = await this.fetcher(url, { signal: AbortSignal.timeout(DESCRIPTION_FETCH_TIMEOUT_MS) })
+        response = await this.fetcher(url, { signal: AbortSignal.timeout(this.fetchTimeoutMs) })
       } catch {
         continue
       }

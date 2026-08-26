@@ -17,6 +17,7 @@ import type {} from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-locale/client'
 import type {} from '@deepseek-ai/dsh-client-ui-settings/client'
 import type { TranslateNS } from '@deepseek-ai/dsh-client-ui-slots'
+import type { SearchItem } from './service'
 
 /** Dictionary namespace; the settings.section registration binds it via `locale`. */
 const NS = 'skill-manager'
@@ -78,15 +79,6 @@ const DICT: Record<'zh' | 'en', Record<DictKey, string>> = {
 
 /** Host route prefix — must equal ROUTE_PREFIX in index.ts (bundles stay independent). */
 const API_BASE = '/skill-manager/api'
-
-/** One Catalog search result item, as mapped by the host search endpoint. */
-interface SearchItem {
-  name: string
-  skillId: string
-  source: string
-  installs: number
-  pageUrl: string
-}
 
 /** Search area state machine: the four states stay visually distinct. */
 type SearchState =
@@ -259,6 +251,13 @@ export function apply(ctx: Context): void {
     icon: 'skill',
     locale: NS,
   } as const
+  // Lifecycle: no explicit ctx.effect is needed around the slot registration —
+  // the framework manages it per fiber. SlotRegistry.register is documented as
+  // "disposal through the caller's ctx.effect (fiber unload = cascade)" and
+  // slots.inject as "The controller belongs to the caller's fiber, so plugin
+  // unload cancels a pending wait and removes any active contribution"
+  // (@deepseek-ai/dsh-client-runtime 0.1.1-rc.2, lib/types/client/slots.d.ts):
+  // reloading or unloading this plugin unregisters the settings section.
   ctx.slots.inject('settings.section', () => ctx.slots.register(entry, SkillManagerSection))
 }
 

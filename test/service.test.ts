@@ -25,6 +25,7 @@ function makeService(fetcher: Fetcher, overrides: Partial<SkillManagerOptions> =
     githubRawBase: 'https://raw.githubusercontent.com',
     fetchConcurrency: 5,
     descriptionCacheMaxEntries: 200,
+    descriptionFetchTimeoutMs: 10_000,
     fetcher,
     ...overrides,
   })
