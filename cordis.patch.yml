@@ -1,0 +1,7 @@
+# dsh-skill-manager bundle patch
+#
+# Applied by `dsh plugin --profile <name> add <pkg>` as a Loader bundle layer;
+# the insert row mounts the plugin by package name under the `skill-manager` id.
+- insert:
+    - id: skill-manager
+      name: '@q-puzzler/dsh-skill-manager'
