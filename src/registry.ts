@@ -6,7 +6,7 @@
  * "managed by this plugin": Unmanaged directories never get a record.
  */
 import { randomBytes } from 'node:crypto'
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 /** Registry directory name inside the Skills Directory (no SKILL.md → skipped by dsh). */
@@ -19,12 +19,22 @@ export interface RegistryRecord {
   skillId: string
   /** Repo-relative Skill path found at install time (`skills/<id>`, `<id>`, or '' for repo root). */
   skillPath: string
-  /** ISO 8601 install time. */
+  /** ISO 8601 install time (preserved across updates). */
   installedAt: string
-  /** Last Source commit touching skillPath at install time (update detection). */
+  /** ISO 8601 time of the last successful update; absent until the first one. */
+  updatedAt?: string
+  /** Last Source commit touching skillPath at install/update time (update detection). */
   commitSha: string
   /** sha256 over sorted relative paths + file contents (local-modification detection). */
   contentHash: string
+  /**
+   * Sticky outcome of the last update check: the Source answered a 404-class
+   * response (repo gone/private/renamed) or no longer contains the Skill.
+   * Persisted so list-installed shows the badge cheaply and update() can
+   * refuse without a network call; checkUpdates() maintains it (sets on
+   * 404-class, clears on a healthy check), so staleness self-heals.
+   */
+  sourceInvalid?: boolean
 }
 
 export function registryDir(skillsDir: string): string {
@@ -88,6 +98,11 @@ export async function writeRecord(skillsDir: string, record: RegistryRecord): Pr
   await rename(temp, target)
 }
 
+/** Remove a record (uninstall); an already-missing file is benign. */
+export async function removeRecord(skillsDir: string, skillId: string): Promise<void> {
+  await rm(recordPath(skillsDir, skillId), { force: true })
+}
+
 function isRegistryRecord(value: unknown): value is RegistryRecord {
   if (typeof value !== 'object' || value === null) return false
   const record = value as Record<string, unknown>
@@ -97,6 +112,8 @@ function isRegistryRecord(value: unknown): value is RegistryRecord {
     typeof record.skillPath === 'string' &&
     typeof record.installedAt === 'string' &&
     typeof record.commitSha === 'string' &&
-    typeof record.contentHash === 'string'
+    typeof record.contentHash === 'string' &&
+    (record.updatedAt === undefined || typeof record.updatedAt === 'string') &&
+    (record.sourceInvalid === undefined || typeof record.sourceInvalid === 'boolean')
   )
 }
