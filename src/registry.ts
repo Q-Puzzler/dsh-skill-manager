@@ -5,6 +5,7 @@
  * to dsh discovery and its watcher. The Registry is the sole authority for
  * "managed by this plugin": Unmanaged directories never get a record.
  */
+import { randomBytes } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
@@ -71,12 +72,18 @@ export async function listRecords(skillsDir: string): Promise<RegistryRecord[]> 
   return records
 }
 
-/** Write a record atomically (temp file + rename inside the registry dir). */
+/**
+ * Write a record atomically (temp file + rename inside the registry dir).
+ * The temp name carries a random component (same pattern as stagingPath) so
+ * concurrent writers of the same skill never share one temp path — with a
+ * deterministic name the second rename would ENOENT on the first writer's
+ * already-renamed file.
+ */
 export async function writeRecord(skillsDir: string, record: RegistryRecord): Promise<void> {
   const dir = registryDir(skillsDir)
   await mkdir(dir, { recursive: true })
   const target = recordPath(skillsDir, record.skillId)
-  const temp = join(dir, `.${record.skillId}.json.tmp-${process.pid}`)
+  const temp = join(dir, `.${record.skillId}.json.tmp-${process.pid}-${randomBytes(6).toString('hex')}`)
   await writeFile(temp, `${JSON.stringify(record, null, 2)}\n`, 'utf8')
   await rename(temp, target)
 }

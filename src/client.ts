@@ -47,6 +47,7 @@ type DictKey =
   | 'install.installed'
   | 'install.retry'
   | 'install.failed'
+  | 'install.error.skill-not-found'
   | 'confirm.title'
   | 'confirm.skill'
   | 'confirm.source'
@@ -85,6 +86,7 @@ const DICT: Record<'zh' | 'en', Record<DictKey, string>> = {
     'install.installed': '已安装',
     'install.retry': '重试',
     'install.failed': '安装失败：{message}',
+    'install.error.skill-not-found': '该 Source 中不存在此技能',
     'confirm.title': '确认{action}',
     'confirm.skill': '技能',
     'confirm.source': '来源',
@@ -115,6 +117,7 @@ const DICT: Record<'zh' | 'en', Record<DictKey, string>> = {
     'install.installed': 'Installed',
     'install.retry': 'Retry',
     'install.failed': 'Install failed: {message}',
+    'install.error.skill-not-found': 'The Source does not contain this skill',
     'confirm.title': 'Confirm {action}',
     'confirm.skill': 'Skill',
     'confirm.source': 'Source',
@@ -142,6 +145,19 @@ interface ApiEnvelope<T> {
   ok: boolean
   data?: T
   error?: string
+  /** Host machine-readable error category (InstallError code), when present. */
+  code?: string
+}
+
+/** Host API failure; `code` lets the UI localize known categories via the DICT. */
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message)
+    this.name = 'ApiError'
+  }
 }
 
 async function callApi<T>(path: string, init?: { method?: 'GET' | 'POST'; body?: unknown }): Promise<T> {
@@ -153,7 +169,7 @@ async function callApi<T>(path: string, init?: { method?: 'GET' | 'POST'; body?:
   })
   const body = (await response.json().catch(() => undefined)) as ApiEnvelope<T> | undefined
   if (!response.ok || body?.ok !== true || body.data === undefined) {
-    throw new Error(body?.error ?? `HTTP ${response.status}`)
+    throw new ApiError(body?.error ?? `HTTP ${response.status}`, body?.code)
   }
   return body.data
 }
@@ -315,7 +331,15 @@ function SearchResultItem(props: {
       setInstall({ phase: 'idle' })
       props.onInstalled()
     } catch (error) {
-      setInstall({ phase: 'error', message: error instanceof Error ? error.message : String(error) })
+      // Host messages are English; known error codes get localized DICT copy
+      // instead of surfacing the raw host message.
+      const message =
+        error instanceof ApiError && error.code === 'skill-not-found'
+          ? t('install.error.skill-not-found')
+          : error instanceof Error
+            ? error.message
+            : String(error)
+      setInstall({ phase: 'error', message })
     }
   }
 

@@ -7,9 +7,14 @@
  * with fake fetchers and a temp Skills Directory root.
  *
  * Path Safety (CONTEXT.md): every tar entry name is scanned BEFORE selection
- * — absolute paths and `..` segments fail the whole install; within the
- * selected prefix only regular files are extracted (symlink/hardlink entries
- * are skipped), and each staged path is resolve-checked against the staging
+ * — an absolute path or `..` segment ANYWHERE fails the whole install (fail
+ * closed on malicious archives). Selection then keeps only regular files
+ * under the chosen prefix: a backslash-traversal entry pointing outside the
+ * prefix can never match the prefix and is rejected at selection, while ANY
+ * backslash inside the prefix fails the install outright (backslash is not a
+ * tar separator but IS one on Windows). Symlink/hardlink entries are skipped
+ * (never materialized); duplicate entry names collapse, the later one
+ * winning. Each staged path is still resolve-checked against the staging
  * root. Any failure before the final rename leaves zero partial files.
  */
 import { createHash, randomBytes } from 'node:crypto'
@@ -62,10 +67,8 @@ export async function resolveHead(options: InstallNetworkOptions, ref: SourceRef
   if (typeof defaultBranch !== 'string' || defaultBranch === '') {
     throw new InstallError('upstream', `unexpected GitHub repo response for ${ref.owner}/${ref.repo}: no default_branch`)
   }
-  const params = new URLSearchParams({ sha: defaultBranch, per_page: '1' })
-  const commits = await fetchJson(options, `${options.githubApiBase}/repos/${ref.owner}/${ref.repo}/commits?${params}`)
-  const sha = Array.isArray(commits) ? (commits[0] as { sha?: unknown } | undefined)?.sha : undefined
-  if (typeof sha !== 'string' || sha === '') {
+  const sha = await fetchFirstCommitSha(options, ref, new URLSearchParams({ sha: defaultBranch, per_page: '1' }))
+  if (sha === undefined) {
     throw new InstallError('upstream', `cannot resolve HEAD commit of ${ref.owner}/${ref.repo}@${defaultBranch}`)
   }
   return { headSha: sha, defaultBranch }
@@ -85,13 +88,25 @@ export async function resolvePathCommit(
 ): Promise<string | undefined> {
   if (skillPath === '') return undefined // repo-root layout: HEAD is the answer
   try {
-    const params = new URLSearchParams({ sha: defaultBranch, path: skillPath, per_page: '1' })
-    const commits = await fetchJson(options, `${options.githubApiBase}/repos/${ref.owner}/${ref.repo}/commits?${params}`)
-    const sha = Array.isArray(commits) ? (commits[0] as { sha?: unknown } | undefined)?.sha : undefined
-    return typeof sha === 'string' && sha !== '' ? sha : undefined
+    return await fetchFirstCommitSha(
+      options,
+      ref,
+      new URLSearchParams({ sha: defaultBranch, path: skillPath, per_page: '1' }),
+    )
   } catch {
     return undefined
   }
+}
+
+/** Shared `commits?...&per_page=1` lookup: the first (only) commit's SHA, or undefined. */
+async function fetchFirstCommitSha(
+  options: InstallNetworkOptions,
+  ref: SourceRef,
+  params: URLSearchParams,
+): Promise<string | undefined> {
+  const commits = await fetchJson(options, `${options.githubApiBase}/repos/${ref.owner}/${ref.repo}/commits?${params}`)
+  const sha = Array.isArray(commits) ? (commits[0] as { sha?: unknown } | undefined)?.sha : undefined
+  return typeof sha === 'string' && sha !== '' ? sha : undefined
 }
 
 /** Download `codeload .../tar.gz/<sha>` and gunzip it into the tar buffer. */
@@ -366,6 +381,7 @@ async function fetchJson(options: InstallNetworkOptions, url: string): Promise<u
   }
 }
 
-function errorMessage(error: unknown): string {
+/** Best-effort message for an unknown thrown value (shared with the service layer). */
+export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }

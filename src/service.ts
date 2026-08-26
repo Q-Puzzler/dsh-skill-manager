@@ -23,6 +23,7 @@ import {
   InstallError,
   collectSkillFiles,
   downloadTarball,
+  errorMessage,
   hashDirectory,
   locateSkill,
   pathExists,
@@ -76,6 +77,8 @@ export interface SkillManagerOptions {
   installFetchTimeoutMs: number
   fetcher: Fetcher
   binaryFetcher: BinaryFetcher
+  /** Registry record writer (test seam for write failures); defaults to registry.writeRecord. */
+  writeRecord?: (skillsDir: string, record: RegistryRecord) => Promise<void>
 }
 
 /** One Catalog search result, mapped for the settings page. */
@@ -126,6 +129,8 @@ export interface InstallSuccess {
   installedAt: string
   commitSha: string
   contentHash: string
+  /** Non-fatal cleanup notice (e.g. a leftover backup directory); absent when all clean. */
+  warning?: string
 }
 
 export type InstallResult = InstallSuccess | ConfirmationRequired
@@ -189,6 +194,9 @@ export class SkillManager {
   private readonly semaphore: Semaphore
   private readonly cache: BoundedCache<string | null>
   private readonly pending = new Map<string, Promise<string | null>>()
+  private readonly recordWriter: (skillsDir: string, record: RegistryRecord) => Promise<void>
+  /** Per-skill install mutex: skillId → tail of that skill's serialized install chain. */
+  private readonly installChains = new Map<string, Promise<void>>()
 
   constructor(options: SkillManagerOptions) {
     this.catalogUrl = options.catalogUrl.replace(/\/+$/, '')
@@ -202,6 +210,7 @@ export class SkillManager {
     this.installTimeoutMs = Math.max(1, Math.floor(options.installFetchTimeoutMs))
     this.semaphore = new Semaphore(Math.max(1, Math.floor(options.fetchConcurrency)))
     this.cache = new BoundedCache(Math.max(1, Math.floor(options.descriptionCacheMaxEntries)))
+    this.recordWriter = options.writeRecord ?? writeRecord
   }
 
   /**
@@ -293,8 +302,32 @@ export class SkillManager {
    * unsafe-archive / upstream / fs) on failure; any failure before the swap
    * leaves zero partial files, and a post-swap failure rolls the previous
    * directory back into place.
+   *
+   * Installs of the SAME skill are serialized through a per-skill promise
+   * chain, so concurrent staging/swap/record writes can never interleave
+   * (the registry temp-file race); different skills still install in
+   * parallel. A successful install may carry a `warning` when non-fatal
+   * cleanup (removing the previous-version backup) failed — residue there
+   * is harmless and never rolls the install back.
    */
   async install(request: InstallRequest): Promise<InstallResult> {
+    const previous = this.installChains.get(request.skillId) ?? Promise.resolve()
+    const result = previous.then(() => this.installSerialized(request))
+    // The chain link swallows the outcome, so one failed install cannot jam
+    // the queue; each caller still sees their own result or rejection.
+    const link = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    this.installChains.set(request.skillId, link)
+    void link.then(() => {
+      if (this.installChains.get(request.skillId) === link) this.installChains.delete(request.skillId)
+    })
+    return result
+  }
+
+  /** The install pipeline body; always runs inside the per-skill mutex. */
+  private async installSerialized(request: InstallRequest): Promise<InstallResult> {
     const ref = parseSource(request.source)
     if (ref === undefined || !isValidSkillId(request.skillId)) {
       throw new InstallError(
@@ -331,7 +364,7 @@ export class SkillManager {
     const tar = await downloadTarball(network, ref, headSha)
     const location = await locateSkill(tar, request.skillId)
     if (location === undefined) {
-      throw new InstallError('skill-not-found', `Source 缺失该技能：${request.source} 中不存在技能 ${request.skillId}`)
+      throw new InstallError('skill-not-found', `skill ${request.skillId} not found in source ${request.source}`)
     }
     const files = await collectSkillFiles(tar, location.prefix)
     // Staging lives inside the Skills Directory so the final rename is atomic
@@ -357,8 +390,18 @@ export class SkillManager {
         commitSha: pathCommit ?? headSha,
         contentHash,
       }
-      await writeRecord(root, record)
-      if (backup !== undefined) await rm(backup, { recursive: true, force: true })
+      await this.recordWriter(root, record)
+      let warning: string | undefined
+      if (backup !== undefined) {
+        try {
+          await rm(backup, { recursive: true, force: true })
+        } catch (cleanupError) {
+          // Backup cleanup is best-effort: leftover residue is harmless, so a
+          // failed removal degrades to a warning — it must never fail (let
+          // alone roll back) an otherwise successful install.
+          warning = `previous-version backup could not be removed (harmless residue at ${backup}): ${errorMessage(cleanupError)}`
+        }
+      }
       return {
         status: 'installed',
         action,
@@ -368,11 +411,19 @@ export class SkillManager {
         installedAt: record.installedAt,
         commitSha: record.commitSha,
         contentHash,
+        ...(warning !== undefined ? { warning } : {}),
       }
     } catch (error) {
-      await rm(targetPath, { recursive: true, force: true })
-      if (backup !== undefined) await rename(backup, targetPath)
-      throw toInstallError(error)
+      const failure = toInstallError(error)
+      try {
+        await rm(targetPath, { recursive: true, force: true })
+        if (backup !== undefined) await rename(backup, targetPath)
+      } catch (rollbackError) {
+        // The original failure stays primary; rollback trouble is appended as
+        // supplementary context instead of masking it.
+        throw new InstallError(failure.code, `${failure.message} (rollback incomplete: ${errorMessage(rollbackError)})`)
+      }
+      throw failure
     }
   }
 
@@ -396,10 +447,6 @@ function mapSearchItem(raw: unknown, catalogUrl: string): SearchItem | undefined
     installs: typeof entry.installs === 'number' && Number.isFinite(entry.installs) ? entry.installs : 0,
     pageUrl: `${catalogUrl}/${entry.id}`,
   }
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
 }
 
 /** Wrap unexpected filesystem failures; InstallErrors pass through unchanged. */

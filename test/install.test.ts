@@ -10,7 +10,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { InstallError } from '../src/install'
 import type { RegistryRecord } from '../src/registry'
 import { SkillManager } from '../src/service'
-import type { BinaryFetcher, Fetcher } from '../src/service'
+import type { BinaryFetcher, Fetcher, SkillManagerOptions } from '../src/service'
 
 /* ---------------------------------------------------------------- fixtures */
 
@@ -148,7 +148,12 @@ async function makeTempRoot(): Promise<{ tmp: string; skillsDir: string }> {
   return { tmp, skillsDir: join(tmp, 'skills') }
 }
 
-function makeService(skillsDir: string, textRoutes: TextRoute[], binaryRoutes: BinaryRoute[]) {
+function makeService(
+  skillsDir: string,
+  textRoutes: TextRoute[],
+  binaryRoutes: BinaryRoute[],
+  extras: Partial<SkillManagerOptions> = {},
+) {
   const text = makeTextFetcher(textRoutes)
   const binary = makeBinaryFetcher(binaryRoutes)
   const service = new SkillManager({
@@ -163,6 +168,7 @@ function makeService(skillsDir: string, textRoutes: TextRoute[], binaryRoutes: B
     installFetchTimeoutMs: 30_000,
     fetcher: text.fetcher,
     binaryFetcher: binary.fetcher,
+    ...extras,
   })
   return { service, textCalls: text.calls, binaryCalls: binary.calls }
 }
@@ -345,13 +351,83 @@ describe('SkillManager.install', () => {
     expect((await readRegistryRecord(skillsDir, 'wayfinder')).skillId).toBe('wayfinder')
   })
 
+  it('serializes concurrent installs of the same skill into a correct final state', async () => {
+    const { skillsDir } = await makeTempRoot()
+    const tarGz = await buildTarGz(standardEntries())
+    const { service } = makeService(skillsDir, githubRoutes(), [{ match: '/tar.gz/', body: tarGz }])
+
+    // Two installs racing one skill: the per-skill mutex must serialize them
+    // (the first a fresh install, the second a confirmed reinstall) instead of
+    // interleaving staging/swap/record writes.
+    const [first, second] = await Promise.all([
+      service.install({ ...INSTALL, confirm: true }),
+      service.install({ ...INSTALL, confirm: true }),
+    ])
+    expect(first).toMatchObject({ status: 'installed', action: 'install' })
+    expect(second).toMatchObject({ status: 'installed', action: 'reinstall' })
+
+    // Final state is complete and consistent: files, record, and hash agree.
+    expect(await listFilesRecursive(join(skillsDir, 'wayfinder'))).toEqual(['SKILL.md', 'scripts/run.sh'])
+    expect(await readFile(join(skillsDir, 'wayfinder', 'SKILL.md'), 'utf8')).toBe(skillMd('wayfinder'))
+    expect(await readFile(join(skillsDir, 'wayfinder', 'scripts', 'run.sh'), 'utf8')).toBe('#!/bin/sh\necho hi\n')
+    const record = await readRegistryRecord(skillsDir, 'wayfinder')
+    expect(record).toMatchObject({
+      source: 'owner/repo',
+      skillId: 'wayfinder',
+      skillPath: 'skills/wayfinder',
+      commitSha: PATH_SHA,
+    })
+    expect(record.contentHash).toBe(await hashInstalled(join(skillsDir, 'wayfinder')))
+    // No staging/backup/temp-file residue from racing writers.
+    expect(await readdir(join(skillsDir, '.skill-manager'))).toEqual(['wayfinder.json'])
+  })
+
+  it('rolls the previous version back when the post-swap registry write fails', async () => {
+    const { skillsDir } = await makeTempRoot()
+    // v1 is installed and recorded.
+    const v1 = await buildTarGz(standardEntries())
+    const { service: service1 } = makeService(skillsDir, githubRoutes(), [{ match: '/tar.gz/', body: v1 }])
+    await service1.install(INSTALL)
+    const v1Record = await readRegistryRecord(skillsDir, 'wayfinder')
+
+    // A confirmed reinstall to v2 whose registry write is injected to fail
+    // AFTER the swap — the previous version must be rolled back into place.
+    const v2 = await buildTarGz(standardEntries({ scriptContent: '#!/bin/sh\necho v2\n' }))
+    const { service: service2 } = makeService(
+      skillsDir,
+      githubRoutes({ headSha: 'c'.repeat(40), pathSha: 'd'.repeat(40) }),
+      [{ match: '/tar.gz/', body: v2 }],
+      {
+        writeRecord: async () => {
+          throw new Error('no space left on device')
+        },
+      },
+    )
+    const failure = await service2.install({ ...INSTALL, confirm: true }).catch((error: unknown) => error)
+    // The error is readable: an InstallError naming the underlying cause.
+    expect(failure).toBeInstanceOf(InstallError)
+    expect((failure as InstallError).code).toBe('fs')
+    expect((failure as InstallError).message).toContain('no space left on device')
+
+    // The old version is restored byte-for-byte (content + hash agree with
+    // the untouched record), and the Registry holds no new record.
+    expect(await listFilesRecursive(join(skillsDir, 'wayfinder'))).toEqual(['SKILL.md', 'scripts/run.sh'])
+    expect(await readFile(join(skillsDir, 'wayfinder', 'SKILL.md'), 'utf8')).toBe(skillMd('wayfinder'))
+    expect(await readFile(join(skillsDir, 'wayfinder', 'scripts', 'run.sh'), 'utf8')).toBe('#!/bin/sh\necho hi\n')
+    expect(await hashInstalled(join(skillsDir, 'wayfinder'))).toBe(v1Record.contentHash)
+    expect(await readRegistryRecord(skillsDir, 'wayfinder')).toEqual(v1Record)
+    // No v2 residue: no backup or staging directories left behind.
+    expect(await readdir(join(skillsDir, '.skill-manager'))).toEqual(['wayfinder.json'])
+  })
+
   it('fails with a clear error when the Source is missing the skill (zero writes)', async () => {
     const { tmp, skillsDir } = await makeTempRoot()
     const tarGz = await buildTarGz([{ name: `${PREFIX}/skills/other-skill/SKILL.md`, content: skillMd('other-skill') }])
     const { service } = makeService(skillsDir, githubRoutes(), [{ match: '/tar.gz/', body: tarGz }])
     await expect(service.install(INSTALL)).rejects.toBeInstanceOf(InstallError)
     await expect(service.install(INSTALL)).rejects.toMatchObject({ code: 'skill-not-found' })
-    await expect(service.install(INSTALL)).rejects.toThrow(/Source 缺失该技能/)
+    // Host error messages stay English; the client localizes by error code.
+    await expect(service.install(INSTALL)).rejects.toThrow('skill wayfinder not found in source owner/repo')
     expect(await readdir(tmp)).toEqual([])
   })
 

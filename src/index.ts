@@ -214,7 +214,9 @@ export function apply(ctx: Context, config: Config): void {
                 json(res, 200, { ok: true, data: result })
               } catch (error) {
                 if (error instanceof InstallError) {
-                  json(res, INSTALL_ERROR_STATUS[error.code], { ok: false, error: error.message })
+                  // `code` rides along so the client maps its own localized
+                  // copy (host messages stay English by convention).
+                  json(res, INSTALL_ERROR_STATUS[error.code], { ok: false, code: error.code, error: error.message })
                   return
                 }
                 throw error
