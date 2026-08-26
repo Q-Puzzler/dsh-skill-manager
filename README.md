@@ -2,7 +2,17 @@
 
 A DeepSeek Harness (dsh) plugin for browsing, installing, updating and uninstalling skills from [skills.sh](https://www.skills.sh/), with a dedicated entry in the dsh WebUI settings.
 
-> Work in progress.
+> Work in progress. 当前进度：T2（搜索浏览 Catalog，端到端）已完成——WebUI 设置中出现独立的「技能管理」区块，可按关键词搜索 Catalog，逐条懒加载技能简介；安装/更新/卸载将在后续 ticket 落地。
+
+## 功能（T2）
+
+- 设置页注册进 `settings.section` slot（id `skill-manager`，order 20），与内置设置区同款 seam。
+- host 侧 SkillManager 服务在 `ctx.webServer` 上注册插件独立前缀 `/skill-manager/api`：
+  - `GET /skill-manager/api/search?q=<关键词>`：代理 Catalog 搜索 API，返回名称、Skill ID、Source、安装量、Catalog 页面 URL。
+  - `GET /skill-manager/api/fetch-description?source=<owner/repo>&skillId=<id>`：从 Source 仓库 SKILL.md frontmatter 解析简介（探测顺序 `skills/<id>/SKILL.md` → `<id>/SKILL.md` → 根 `SKILL.md`），带缓存与并发上限；任何失败静默返回 `null`（页面显示「暂无简介」）。
+- 部署可调值均为带默认值的插件 Config 字段：`catalogUrl`、`githubRawBase`、`fetchConcurrency`、`descriptionCacheMaxEntries`。
+- 设置页 i18n：`ctx.locale.register` 双语词典（zh-CN 默认 + en）。
+
 
 ## 安装
 
