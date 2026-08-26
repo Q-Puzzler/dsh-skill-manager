@@ -2,7 +2,17 @@
 
 A DeepSeek Harness (dsh) plugin for browsing, installing, updating and uninstalling skills from [skills.sh](https://www.skills.sh/), with a dedicated entry in the dsh WebUI settings.
 
-> Work in progress. 当前进度：T2（搜索浏览 Catalog，端到端）已完成——WebUI 设置中出现独立的「技能管理」区块，可按关键词搜索 Catalog，逐条懒加载技能简介；安装/更新/卸载将在后续 ticket 落地。
+> Work in progress. 当前进度：T3（安装技能，端到端）已完成——每条搜索结果提供安装入口，一键落入 Skills Directory（dsh 无需重启即可发现），每次安装写入 Registry 记录；Managed 结果显示「已安装」，重装与覆盖 Unmanaged 同名目录均走两段式 Confirmation（host 强制，未确认零写入）。更新/卸载将在后续 ticket 落地。
+
+## 功能（T3）
+
+在 T2 基础上新增：
+
+- `POST /skill-manager/api/install`（body `{source, skillId, confirm?}`）：安装管线（ADR-0001）——校验 Skill ID / Source → 解析 Source 默认分支 HEAD commit（GitHub API）→ 下载 codeload tarball → 与简介相同的探测顺序（`skills/<id>/` → `<id>/` → 仓库根）定位技能子目录 → 严格白名单只解出普通文件（全档扫描拒绝绝对路径与 `..` 条目、跳过 symlink/hardlink、逐文件 resolve 前缀校验）→ Skills Directory 内暂存 → 原子重命名到位（已存在时先换出备份，失败回滚）→ sha256 内容哈希（排序相对路径 + 文件内容）→ 写入 Registry 记录（`~/.dsh/skills/.skill-manager/<skillId>.json`：source、skillId、skillPath、installedAt、commitSha——技能路径上最后 commit、contentHash）。
+- 两段式 Confirmation 协议（ADR-0004）首次落地：目标不存在 → 直接安装；目标已 Managed → 重装需确认；目标为 Unmanaged 同名目录 → Overwrite 需确认。未带 `confirm: true` 的需确认调用返回 `{status:'confirmation-required', action, skillId, source, targetPath}` 且零写入零网络；host 不信任 UI 已询问。
+- `GET /skill-manager/api/list-installed`：Registry 中全部 Managed Skill 记录（畸形记录跳过）。
+- 新增 Config 字段：`githubApiBase`（默认 `https://api.github.com`）、`githubCodeloadBase`（默认 `https://codeload.github.com`）、`installFetchTimeoutMs`（默认 30000）、`skillsDir`（默认按 dsh 解析 `$DSH_HOME/skills`，缺省 `~/.dsh/skills`）。
+- 设置页：每条结果提供安装按钮（安装 / 安装中 / 已安装——点击即重装走确认 / 失败可重试），「已安装」状态来自 list-installed；共享 Confirmation modal（写明技能、Source、目标路径、动作：重装/覆盖安装，确认/取消）承载两段式流程。
 
 ## 功能（T2）
 

@@ -23,10 +23,18 @@ function makeService(fetcher: Fetcher, overrides: Partial<SkillManagerOptions> =
   return new SkillManager({
     catalogUrl: 'https://www.skills.sh',
     githubRawBase: 'https://raw.githubusercontent.com',
+    githubApiBase: 'https://api.github.com',
+    githubCodeloadBase: 'https://codeload.github.com',
+    // Search/description tests never touch the filesystem or binary fetches.
+    skillsDir: '/nonexistent-test-root',
     fetchConcurrency: 5,
     descriptionCacheMaxEntries: 200,
     descriptionFetchTimeoutMs: 10_000,
+    installFetchTimeoutMs: 30_000,
     fetcher,
+    binaryFetcher: async () => {
+      throw new Error('binary fetcher not expected in these tests')
+    },
     ...overrides,
   })
 }

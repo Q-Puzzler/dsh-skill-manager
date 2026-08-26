@@ -1,15 +1,40 @@
 /**
- * SkillManager — the host-side service holding all Catalog search logic
- * (ADR-0005: the single test seam). Plain class with an injected fetcher, so
- * tests run without network; the cordis plugin (index.ts) wires it to HTTP.
+ * SkillManager — the host-side service holding all Catalog search and Skill
+ * install logic (ADR-0005: the single test seam). Plain class with injected
+ * fetchers and an injected Skills Directory root, so tests run without
+ * network and without touching the real `~/.dsh/skills`; the cordis plugin
+ * (index.ts) wires it to HTTP.
  *
- * Two data flows, honoring the exam's source constraints:
+ * Three data flows, honoring the exam's source constraints:
  * - search: only the Catalog is contacted (`GET <catalogUrl>/api/search?q=`).
  * - description: fetched lazily from the Source repository the Catalog entry
  *   itself names, via raw SKILL.md frontmatter; every failure degrades to the
  *   null sentinel (the UI shows its placeholder) — never an error state.
+ * - install: the ADR-0001 pipeline (commit resolution → codeload tarball →
+ *   whitelist extraction → staging → atomic rename → Registry record) plus
+ *   the two-phase Confirmation protocol (ADR-0004): reinstalls and Overwrites
+ *   of Unmanaged directories require `confirm: true`, checked by the host
+ *   before any network call or write.
  */
+import { mkdir, rm, rename } from 'node:fs/promises'
+import { join, resolve, sep } from 'node:path'
 import { extractFrontmatterDescription } from './frontmatter'
+import {
+  InstallError,
+  collectSkillFiles,
+  downloadTarball,
+  hashDirectory,
+  locateSkill,
+  pathExists,
+  resolveHead,
+  resolvePathCommit,
+  stagingPath,
+  swapIntoPlace,
+  writeStagedFiles,
+} from './install'
+import type { InstallNetworkOptions } from './install'
+import { listRecords, readRecord, registryDir, writeRecord } from './registry'
+import type { RegistryRecord } from './registry'
 import { isValidSkillId, parseSource } from './validation'
 
 /** Minimal structural subset of fetch/Response the service relies on. */
@@ -21,18 +46,36 @@ export interface FetchResult {
 
 export type Fetcher = (url: string, init?: { signal?: AbortSignal }) => Promise<FetchResult>
 
+/** Binary subset of fetch/Response for tarball downloads. */
+export interface BinaryFetchResult {
+  ok: boolean
+  status: number
+  arrayBuffer(): Promise<ArrayBuffer>
+}
+
+export type BinaryFetcher = (url: string, init?: { signal?: AbortSignal }) => Promise<BinaryFetchResult>
+
 export interface SkillManagerOptions {
   /** Catalog base URL — the sole online data source for searching and linking Skills. */
   catalogUrl: string
   /** Base URL for raw Source file fetches (SKILL.md descriptions). */
   githubRawBase: string
+  /** GitHub API base for commit resolution (repo info, commits). */
+  githubApiBase: string
+  /** Codeload base for tarball downloads. */
+  githubCodeloadBase: string
+  /** Skills Directory root ($DSH_HOME/skills resolution happens in index.ts). */
+  skillsDir: string
   /** Upper bound of concurrent Source fetches. */
   fetchConcurrency: number
   /** Upper bound of cached description outcomes (positive and negative). */
   descriptionCacheMaxEntries: number
   /** Per-request Source fetch timeout in milliseconds. */
   descriptionFetchTimeoutMs: number
+  /** Per-request timeout for install-time API and tarball fetches, in milliseconds. */
+  installFetchTimeoutMs: number
   fetcher: Fetcher
+  binaryFetcher: BinaryFetcher
 }
 
 /** One Catalog search result, mapped for the settings page. */
@@ -54,6 +97,38 @@ export const DESCRIPTION_PROBE_PATHS = [
 
 /** Thrown by search failures; the route maps it to an error response. */
 export class SearchError extends Error {}
+
+/** What installing a Skill will do to the target directory. */
+export type InstallAction = 'install' | 'reinstall' | 'overwrite'
+
+export interface InstallRequest {
+  source: string
+  skillId: string
+  /** Second phase of the Confirmation protocol: explicit user approval. */
+  confirm?: boolean
+}
+
+/** First-phase response: the host refuses to write until re-called with confirm: true. */
+export interface ConfirmationRequired {
+  status: 'confirmation-required'
+  action: 'reinstall' | 'overwrite'
+  skillId: string
+  source: string
+  targetPath: string
+}
+
+export interface InstallSuccess {
+  status: 'installed'
+  action: InstallAction
+  skillId: string
+  source: string
+  targetPath: string
+  installedAt: string
+  commitSha: string
+  contentHash: string
+}
+
+export type InstallResult = InstallSuccess | ConfirmationRequired
 
 /** Bounded FIFO cache: oldest entries are evicted past the configured size. */
 class BoundedCache<V> {
@@ -104,8 +179,13 @@ class Semaphore {
 export class SkillManager {
   private readonly catalogUrl: string
   private readonly githubRawBase: string
+  private readonly githubApiBase: string
+  private readonly githubCodeloadBase: string
+  private readonly skillsDir: string
   private readonly fetcher: Fetcher
+  private readonly binaryFetcher: BinaryFetcher
   private readonly fetchTimeoutMs: number
+  private readonly installTimeoutMs: number
   private readonly semaphore: Semaphore
   private readonly cache: BoundedCache<string | null>
   private readonly pending = new Map<string, Promise<string | null>>()
@@ -113,8 +193,13 @@ export class SkillManager {
   constructor(options: SkillManagerOptions) {
     this.catalogUrl = options.catalogUrl.replace(/\/+$/, '')
     this.githubRawBase = options.githubRawBase.replace(/\/+$/, '')
+    this.githubApiBase = options.githubApiBase.replace(/\/+$/, '')
+    this.githubCodeloadBase = options.githubCodeloadBase.replace(/\/+$/, '')
+    this.skillsDir = options.skillsDir
     this.fetcher = options.fetcher
+    this.binaryFetcher = options.binaryFetcher
     this.fetchTimeoutMs = Math.max(1, Math.floor(options.descriptionFetchTimeoutMs))
+    this.installTimeoutMs = Math.max(1, Math.floor(options.installFetchTimeoutMs))
     this.semaphore = new Semaphore(Math.max(1, Math.floor(options.fetchConcurrency)))
     this.cache = new BoundedCache(Math.max(1, Math.floor(options.descriptionCacheMaxEntries)))
   }
@@ -192,6 +277,109 @@ export class SkillManager {
     }
     return null
   }
+
+  /**
+   * Install a Skill into the Skills Directory (ADR-0001 pipeline):
+   * validate → Confirmation check → resolve HEAD → download tarball →
+   * locate the Skill subdirectory → whitelist extraction → stage → atomic
+   * rename → content hash → Registry record.
+   *
+   * Two-phase Confirmation (ADR-0004): the target is inspected BEFORE any
+   * network call or write. A fresh target installs directly; an existing
+   * Managed target is a reinstall and an existing Unmanaged directory is an
+   * Overwrite — both return confirmation-required (zero writes) unless the
+   * request carries `confirm: true`. The host never trusts the UI to have
+   * asked. Throws InstallError (invalid-input / skill-not-found /
+   * unsafe-archive / upstream / fs) on failure; any failure before the swap
+   * leaves zero partial files, and a post-swap failure rolls the previous
+   * directory back into place.
+   */
+  async install(request: InstallRequest): Promise<InstallResult> {
+    const ref = parseSource(request.source)
+    if (ref === undefined || !isValidSkillId(request.skillId)) {
+      throw new InstallError(
+        'invalid-input',
+        `invalid source or skill id: ${JSON.stringify(request.source)}, ${JSON.stringify(request.skillId)}`,
+      )
+    }
+    const root = resolve(this.skillsDir)
+    const targetPath = join(root, request.skillId)
+    if (targetPath !== root && !targetPath.startsWith(root + sep)) {
+      // Unreachable given the Skill ID grammar; kept as a hard Path Safety gate.
+      throw new InstallError('invalid-input', `target path escapes the skills directory: ${request.skillId}`)
+    }
+    const targetExists = await pathExists(targetPath)
+    const existing = targetExists ? await readRecord(root, request.skillId) : undefined
+    const action: InstallAction = !targetExists ? 'install' : existing !== undefined ? 'reinstall' : 'overwrite'
+    if (action !== 'install' && request.confirm !== true) {
+      return {
+        status: 'confirmation-required',
+        action,
+        skillId: request.skillId,
+        source: request.source,
+        targetPath,
+      }
+    }
+    const network: InstallNetworkOptions = {
+      githubApiBase: this.githubApiBase,
+      githubCodeloadBase: this.githubCodeloadBase,
+      fetcher: this.fetcher,
+      binaryFetcher: this.binaryFetcher,
+      timeoutMs: this.installTimeoutMs,
+    }
+    const { headSha, defaultBranch } = await resolveHead(network, ref)
+    const tar = await downloadTarball(network, ref, headSha)
+    const location = await locateSkill(tar, request.skillId)
+    if (location === undefined) {
+      throw new InstallError('skill-not-found', `Source 缺失该技能：${request.source} 中不存在技能 ${request.skillId}`)
+    }
+    const files = await collectSkillFiles(tar, location.prefix)
+    // Staging lives inside the Skills Directory so the final rename is atomic
+    // (same filesystem); cleanup on failure leaves zero partial files.
+    await mkdir(registryDir(root), { recursive: true })
+    const staging = stagingPath(root)
+    let backup: string | undefined
+    try {
+      await writeStagedFiles(staging, files)
+      backup = await swapIntoPlace(root, staging, request.skillId)
+    } catch (error) {
+      await rm(staging, { recursive: true, force: true })
+      throw toInstallError(error)
+    }
+    try {
+      const contentHash = await hashDirectory(targetPath)
+      const pathCommit = await resolvePathCommit(network, ref, location.skillPath, defaultBranch)
+      const record: RegistryRecord = {
+        source: request.source,
+        skillId: request.skillId,
+        skillPath: location.skillPath,
+        installedAt: new Date().toISOString(),
+        commitSha: pathCommit ?? headSha,
+        contentHash,
+      }
+      await writeRecord(root, record)
+      if (backup !== undefined) await rm(backup, { recursive: true, force: true })
+      return {
+        status: 'installed',
+        action,
+        skillId: request.skillId,
+        source: request.source,
+        targetPath,
+        installedAt: record.installedAt,
+        commitSha: record.commitSha,
+        contentHash,
+      }
+    } catch (error) {
+      await rm(targetPath, { recursive: true, force: true })
+      if (backup !== undefined) await rename(backup, targetPath)
+      throw toInstallError(error)
+    }
+  }
+
+  /** All Managed Skills (Registry records); the sole authority for "managed". */
+  async listInstalled(): Promise<RegistryRecord[]> {
+    return listRecords(resolve(this.skillsDir))
+  }
 }
 
 /** Map one raw Catalog skill entry; malformed entries are dropped. */
@@ -212,4 +400,10 @@ function mapSearchItem(raw: unknown, catalogUrl: string): SearchItem | undefined
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+/** Wrap unexpected filesystem failures; InstallErrors pass through unchanged. */
+function toInstallError(error: unknown): InstallError {
+  if (error instanceof InstallError) return error
+  return new InstallError('fs', `filesystem operation failed: ${errorMessage(error)}`)
 }
