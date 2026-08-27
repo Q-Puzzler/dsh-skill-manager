@@ -4,6 +4,14 @@
  * `/skill-manager/api` prefix (ADR-0006). The prefix avoids both the dsh-owned
  * `/api` RPC bridge and the `/plugins/<id>/client.js` bundle route; the
  * registration rides ctx.effect so plugin unload disposes the route.
+ *
+ * webServer is a SOFT dependency (#12): no static `inject` export. A hard
+ * inject would leave this loader entry's fiber PENDING in a profile without a
+ * WebUI, and dsh-app-boot fails the whole profile boot on any pending entry
+ * ("pending waiting for service: webServer"). Route registration rides a
+ * nested `ctx.inject(['webServer'], …)` fiber instead: this entry activates
+ * in every profile, routes appear whenever webServer does (and disappear if
+ * it goes away), and a WebUI-less profile only gets one deferred warning.
  */
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -16,9 +24,6 @@ import { SearchError, SkillManager } from './service'
 
 /** Plugin name, matching the loader entry id in cordis.patch.yml. */
 export const name = 'skill-manager'
-
-/** Host services required before activation: the route registry. */
-export const inject: string[] = ['webServer']
 
 /**
  * Skills Directory resolution, mirroring dsh: `$DSH_HOME/skills`, defaulting
@@ -133,6 +138,12 @@ async function readJsonBody(req: import('node:http').IncomingMessage): Promise<u
 }
 
 export function apply(ctx: Context, config: Config): void {
+  ctx.inject(['webServer'], (routeCtx) => registerRoutes(routeCtx, config))
+  warnIfNoWebServer(ctx)
+}
+
+/** Register every endpoint once webServer is available (soft dependency, #12). */
+function registerRoutes(ctx: Context, config: Config): void {
   const service = new SkillManager({
     ...config,
     fetcher: (url, init) => fetch(url, init),
@@ -292,4 +303,32 @@ export function apply(ctx: Context, config: Config): void {
       }),
     'skill-manager: http routes',
   )
+}
+
+/** Minimal shape of the loader service this plugin defers its warning through. */
+interface LoaderLike {
+  await(): Promise<void>
+}
+
+/**
+ * Emit one warning when the profile settles without webServer. The check is
+ * deferred through the loader tree because entries start concurrently — at
+ * apply time webServer may simply not be active yet in a WebUI profile.
+ * Without a loader (bare contexts, unit tests) the check runs immediately.
+ */
+function warnIfNoWebServer(ctx: Context): void {
+  const warn = (): void => {
+    if (ctx.get('webServer') !== undefined) return
+    ctx
+      .logger(name)
+      .warn(
+        'webServer service is not available; skill-manager requires a WebUI-enabled profile (e.g. web) and stays inactive: no routes are registered',
+      )
+  }
+  const loader = ctx.get('loader') as LoaderLike | undefined
+  if (loader === undefined) {
+    warn()
+    return
+  }
+  void loader.await().then(warn, () => {})
 }
