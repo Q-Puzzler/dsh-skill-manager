@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { gzipSync } from 'node:zlib'
@@ -8,9 +8,10 @@ import type { Headers, Pack } from 'tar-stream'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { pathExists } from '../src/install'
+import { removeRecord, writeRecord } from '../src/registry'
 import type { RegistryRecord } from '../src/registry'
 import { SkillManager } from '../src/service'
-import type { BinaryFetcher, Fetcher, SkillManagerOptions } from '../src/service'
+import type { BinaryFetcher, Fetcher, FetchResult, SkillManagerOptions } from '../src/service'
 
 /* ---------------------------------------------------------------- fixtures */
 
@@ -207,6 +208,30 @@ function makeService(
   return { service, textCalls: text.calls, binaryCalls: binary.calls }
 }
 
+/**
+ * A fetcher whose first matching call blocks until `respond` is invoked —
+ * deterministic mid-check interleavings for the stale-snapshot race tests.
+ */
+function makeGatedFetcher(match: string) {
+  let release: ((result: FetchResult) => void) | undefined
+  let signalStarted: (() => void) | undefined
+  const started = new Promise<void>((resolvePromise) => {
+    signalStarted = resolvePromise
+  })
+  const gate = new Promise<FetchResult>((resolvePromise) => {
+    release = resolvePromise
+  })
+  const fetcher: Fetcher = async (url) => {
+    if (url.includes(match)) {
+      signalStarted?.()
+      return gate
+    }
+    return { ok: false, status: 404, text: async () => 'not found' }
+  }
+  const respond = (result: FetchResult): void => release?.(result)
+  return { fetcher, started, respond }
+}
+
 /** Sorted relative paths of every entry under root (missing root → []). */
 async function listFilesRecursive(root: string, relative = ''): Promise<string[]> {
   let entries
@@ -366,6 +391,59 @@ describe('SkillManager.checkUpdates', () => {
       },
     ])
     expect(await readRegistryRecord(skillsDir, 'skill-c')).not.toHaveProperty('sourceInvalid')
+  })
+
+  it('never recreates a record removed by a concurrent uninstall mid-check (stale snapshot)', async () => {
+    const { skillsDir } = await makeTempRoot()
+    await installOne(skillsDir, 'owner/repo-c', 'skill-c', { head: sha('3'), path: sha('c') }, 'echo c')
+
+    // Gate the check's network call so the record can vanish mid-check.
+    const gated = makeGatedFetcher('/repos/owner/repo-c')
+    const { service } = makeService(skillsDir, [], [], { fetcher: gated.fetcher })
+    const checking = service.checkUpdates()
+    await gated.started
+
+    // A concurrent uninstall (directory first, record second — the production
+    // order) completes while the check is still waiting on the network.
+    await rm(join(skillsDir, 'skill-c'), { recursive: true })
+    await removeRecord(skillsDir, 'skill-c')
+
+    gated.respond({ ok: false, status: 404, text: async () => '{"message":"Not Found"}' })
+    expect(await checking).toEqual([
+      { skillId: 'skill-c', source: 'owner/repo-c', updateAvailable: false, sourceInvalid: true },
+    ])
+    // The stale-snapshot write-back must NOT resurrect the removed record.
+    expect(await pathExists(join(skillsDir, '.skill-manager', 'skill-c.json'))).toBe(false)
+    expect(await service.listInstalled()).toEqual([])
+  })
+
+  it('flips only the flag when a concurrent install replaced the record mid-check', async () => {
+    const { skillsDir } = await makeTempRoot()
+    await installOne(skillsDir, 'owner/repo-c', 'skill-c', { head: sha('3'), path: sha('c') }, 'echo c')
+
+    const gated = makeGatedFetcher('/repos/owner/repo-c')
+    const { service } = makeService(skillsDir, [], [], { fetcher: gated.fetcher })
+    const checking = service.checkUpdates()
+    await gated.started
+
+    // A concurrent reinstall writes a fresh record while the check is in flight.
+    const fresh: RegistryRecord = {
+      source: 'owner/repo-c',
+      skillId: 'skill-c',
+      skillPath: 'skills/skill-c',
+      installedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      commitSha: sha('9'),
+      contentHash: 'f'.repeat(64),
+    }
+    await writeRecord(skillsDir, fresh)
+
+    gated.respond({ ok: false, status: 404, text: async () => '{"message":"Not Found"}' })
+    expect(await checking).toEqual([
+      { skillId: 'skill-c', source: 'owner/repo-c', updateAvailable: false, sourceInvalid: true },
+    ])
+    // The flag lands on the FRESH record: its commitSha/installedAt/updatedAt survive.
+    expect(await readRegistryRecord(skillsDir, 'skill-c')).toEqual({ ...fresh, sourceInvalid: true })
   })
 })
 
@@ -529,6 +607,24 @@ describe('SkillManager.update', () => {
       expect(binaryCalls).toEqual([])
     },
   )
+
+  it('surfaces a structured fs error (not a codeless 500) when the target cannot be hashed', async () => {
+    const { skillsDir } = await makeTempRoot()
+    const v1 = await buildTarGz(standardEntries())
+    const { service } = makeService(skillsDir, githubRoutes(), [{ match: '/tar.gz/', body: v1 }])
+    await service.install(INSTALL)
+    // The directory exists (pathExists passes) but cannot be read for hashing —
+    // the same failure mode as a directory deleted between the probe and the hash.
+    await chmod(join(skillsDir, 'wayfinder'), 0o000)
+    try {
+      await expect(service.update({ skillId: 'wayfinder' })).rejects.toMatchObject({
+        name: 'InstallError',
+        code: 'fs',
+      })
+    } finally {
+      await chmod(join(skillsDir, 'wayfinder'), 0o755)
+    }
+  })
 })
 
 describe('SkillManager.uninstall', () => {
@@ -599,5 +695,37 @@ describe('SkillManager.uninstall', () => {
     expect(binaryCalls).toEqual([])
     expect(await readFile(join(skillsDir, 'wayfinder', 'SKILL.md'), 'utf8')).toBe('user-managed content')
     expect(await listFilesRecursive(join(skillsDir, '.skill-manager'))).toEqual([])
+  })
+})
+
+describe('SkillManager.fetchDescription sourceInvalid marking', () => {
+  it('marks a Managed skill sourceInvalid when every probe path answers 404', async () => {
+    const { skillsDir } = await makeTempRoot()
+    await installOne(skillsDir, 'owner/repo-c', 'skill-c', { head: sha('3'), path: sha('c') }, 'echo c')
+    // No raw-content routes: every SKILL.md candidate answers 404 — the
+    // Source provably no longer contains the Skill.
+    const { service } = makeService(skillsDir, [], [])
+    expect(await service.fetchDescription('owner/repo-c', 'skill-c')).toBeNull()
+    expect((await readRegistryRecord(skillsDir, 'skill-c')).sourceInvalid).toBe(true)
+  })
+
+  it('writes nothing for an Unmanaged skill (no record to mark)', async () => {
+    const { skillsDir } = await makeTempRoot()
+    const { service } = makeService(skillsDir, [], [])
+    expect(await service.fetchDescription('owner/repo-c', 'skill-c')).toBeNull()
+    expect(await pathExists(join(skillsDir, '.skill-manager', 'skill-c.json'))).toBe(false)
+    expect(await service.listInstalled()).toEqual([])
+  })
+
+  it('does not mark on a soft failure (found SKILL.md without a description)', async () => {
+    const { skillsDir } = await makeTempRoot()
+    await installOne(skillsDir, 'owner/repo-c', 'skill-c', { head: sha('3'), path: sha('c') }, 'echo c')
+    const { service } = makeService(
+      skillsDir,
+      [{ match: '/skills/skill-c/SKILL.md', body: '---\nname: skill-c\n---\n\n# skill-c\n' }],
+      [],
+    )
+    expect(await service.fetchDescription('owner/repo-c', 'skill-c')).toBeNull()
+    expect(await readRegistryRecord(skillsDir, 'skill-c')).not.toHaveProperty('sourceInvalid')
   })
 })

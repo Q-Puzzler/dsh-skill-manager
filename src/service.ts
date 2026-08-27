@@ -9,7 +9,9 @@
  * - search: only the Catalog is contacted (`GET <catalogUrl>/api/search?q=`).
  * - description: fetched lazily from the Source repository the Catalog entry
  *   itself names, via raw SKILL.md frontmatter; every failure degrades to the
- *   null sentinel (the UI shows its placeholder) — never an error state.
+ *   null sentinel (the UI shows its placeholder) — never an error state. An
+ *   all-404 probe additionally persists sourceInvalid on a Managed record
+ *   (the Source is provably gone); softer failures mark nothing.
  * - install: the ADR-0001 pipeline (commit resolution → codeload tarball →
  *   whitelist extraction → staging → atomic rename → Registry record) plus
  *   the two-phase Confirmation protocol (ADR-0004): reinstalls and Overwrites
@@ -107,6 +109,13 @@ export const DESCRIPTION_PROBE_PATHS = [
   (skillId: string) => `${skillId}/SKILL.md`,
   () => 'SKILL.md',
 ] as const
+
+/** Outcome of probing a Skill's candidate SKILL.md paths. */
+interface DescriptionProbe {
+  description: string | null
+  /** Every candidate path answered 404/410 — the Source no longer contains the Skill. */
+  sourceGone: boolean
+}
 
 /** Thrown by search failures; the route maps it to an error response. */
 export class SearchError extends Error {}
@@ -328,6 +337,12 @@ export class SkillManager {
    * bounded by the concurrency semaphore and cached (negative outcomes too).
    * Returns the null sentinel on ANY failure — invalid input, all probe paths
    * missing, network errors — so the UI silently shows its placeholder.
+   * One side effect escapes the silence: when EVERY candidate path answers a
+   * 404-class response (the Source is gone or no longer contains the Skill)
+   * and the Skill is Managed, the record's sourceInvalid flag is persisted
+   * (the ticket's 404 → Source Invalid badge for the description flow too).
+   * Softer failures — a found SKILL.md without a description, a network
+   * error or non-404 status on any probe — mark nothing.
    */
   async fetchDescription(source: string, skillId: string): Promise<string | null> {
     const ref = parseSource(source)
@@ -338,32 +353,54 @@ export class SkillManager {
     if (pending !== undefined) return pending
     const task = this.semaphore
       .run(() => this.probeDescription(ref.owner, ref.repo, skillId))
-      .catch(() => null)
-      .then((description) => {
-        this.cache.set(key, description)
+      .catch((): DescriptionProbe => ({ description: null, sourceGone: false }))
+      .then(async (probe) => {
+        if (probe.sourceGone) await this.markSourceInvalid(skillId)
+        this.cache.set(key, probe.description)
         this.pending.delete(key)
-        return description
+        return probe.description
       })
     this.pending.set(key, task)
     return task
   }
 
   /** Probe the candidate SKILL.md paths in order; first hit wins. */
-  private async probeDescription(owner: string, repo: string, skillId: string): Promise<string | null> {
+  private async probeDescription(owner: string, repo: string, skillId: string): Promise<DescriptionProbe> {
+    // sourceGone survives only when EVERY probe answered 404/410: the Source
+    // is gone or no longer contains the Skill. Any network error or other
+    // status on any probe is a soft failure and clears it.
+    let sourceGone = true
     for (const buildPath of DESCRIPTION_PROBE_PATHS) {
       const url = `${this.githubRawBase}/${owner}/${repo}/HEAD/${buildPath(skillId)}`
       let response: FetchResult
       try {
         response = await this.fetcher(url, { signal: AbortSignal.timeout(this.fetchTimeoutMs) })
       } catch {
+        sourceGone = false
         continue
       }
-      if (!response.ok) continue
+      if (!response.ok) {
+        if (response.status !== 404 && response.status !== 410) sourceGone = false
+        continue
+      }
       // A found SKILL.md without a usable description ends the probe: the
       // Skill exists at this location and simply has no description to show.
-      return extractFrontmatterDescription(await response.text()) ?? null
+      return { description: extractFrontmatterDescription(await response.text()) ?? null, sourceGone: false }
     }
-    return null
+    return { description: null, sourceGone }
+  }
+
+  /**
+   * Description-probe side effect: every candidate path answered 404-class,
+   * so the Source no longer contains the Skill. Persist sourceInvalid when
+   * the Skill is Managed (an Unmanaged skill has no record to mark) via the
+   * same in-mutex re-read-and-flip write checkUpdates uses, so a concurrent
+   * uninstall/reinstall is never clobbered. Best-effort: a failed write
+   * just leaves the badge to the next checkUpdates run.
+   */
+  private async markSourceInvalid(skillId: string): Promise<void> {
+    const root = resolve(this.skillsDir)
+    await this.runSerialized(skillId, () => this.persistSourceInvalid(root, skillId, true))
   }
 
   /**
@@ -563,9 +600,12 @@ export class SkillManager {
    * network; a later healthy check clears the flag again (staleness
    * self-heals). Any other failure (network, rate limit, 5xx) surfaces as a
    * per-skill retryable `error` and never marks the record invalid. Per-skill
-   * work chains through the same mutation mutex, so a flag write can never
-   * clobber a concurrent install/update record write, and network calls are
-   * bounded by the shared fetch semaphore.
+   * work chains through the same mutation mutex, and the snapshot record only
+   * drives the read-only network check: before a flag is persisted the record
+   * is re-read inside the mutex and only the flag flips on the fresh record —
+   * a concurrent uninstall's removed record is never recreated, and a
+   * concurrent install/update's fresh fields are never overwritten. Network
+   * calls are bounded by the shared fetch semaphore.
    */
   async checkUpdates(): Promise<SkillUpdateState[]> {
     const root = resolve(this.skillsDir)
@@ -584,7 +624,7 @@ export class SkillManager {
     const ref = parseSource(record.source)
     if (ref === undefined) {
       // A tampered record whose Source no longer parses can never be checked.
-      await this.persistSourceInvalid(root, record, true)
+      await this.persistSourceInvalid(root, record.skillId, true)
       return { ...state, sourceInvalid: true }
     }
     const network = this.networkOptions()
@@ -593,7 +633,7 @@ export class SkillManager {
       latest = await this.semaphore.run(() => queryLatestCommit(network, ref, record.skillPath))
     } catch (error) {
       if (error instanceof InstallError && (error.status === 404 || error.status === 410)) {
-        await this.persistSourceInvalid(root, record, true)
+        await this.persistSourceInvalid(root, record.skillId, true)
         return { ...state, sourceInvalid: true }
       }
       // Transient failure: retryable per-skill error, the flag stays untouched.
@@ -602,21 +642,29 @@ export class SkillManager {
     if (latest === undefined) {
       // No commit ever touched the path: the Source no longer contains the
       // Skill (CONTEXT.md Source Invalid).
-      await this.persistSourceInvalid(root, record, true)
+      await this.persistSourceInvalid(root, record.skillId, true)
       return { ...state, sourceInvalid: true }
     }
-    await this.persistSourceInvalid(root, record, false)
+    await this.persistSourceInvalid(root, record.skillId, false)
     return { ...state, sourceInvalid: false, updateAvailable: latest !== record.commitSha, latestCommitSha: latest }
   }
 
   /**
-   * Maintain the record's persisted sourceInvalid flag. Best-effort: the
-   * check result stands even when the write fails — update() on a truly dead
-   * Source hits the 404 again at resolve time and fails before any write.
+   * Maintain the record's persisted sourceInvalid flag. The record that
+   * triggered the check is a STALE snapshot by persist time (listed outside
+   * the per-skill mutex), so the record is re-read here — always inside the
+   * mutex, right before the write: a record removed by a concurrent
+   * uninstall is never recreated, and a record replaced by a concurrent
+   * install/update keeps its fresh fields (commitSha, contentHash,
+   * installedAt) — only the flag flips. Best-effort: the check result stands
+   * even when the write fails — update() on a truly dead Source hits the 404
+   * again at resolve time and fails before any write.
    */
-  private async persistSourceInvalid(root: string, record: RegistryRecord, sourceInvalid: boolean): Promise<void> {
-    if ((record.sourceInvalid === true) === sourceInvalid) return
-    const next: RegistryRecord = { ...record }
+  private async persistSourceInvalid(root: string, skillId: string, sourceInvalid: boolean): Promise<void> {
+    const current = await readRecord(root, skillId)
+    if (current === undefined) return
+    if ((current.sourceInvalid === true) === sourceInvalid) return
+    const next: RegistryRecord = { ...current }
     if (sourceInvalid) next.sourceInvalid = true
     else delete next.sourceInvalid
     try {
@@ -674,8 +722,18 @@ export class SkillManager {
     // Local-modification detection runs BEFORE the Confirmation gate: it is a
     // pure local read (zero network) and the warning must ride the
     // confirmation-required response. A missing directory has nothing local
-    // to lose — the pipeline simply recreates it.
-    const localModified = (await pathExists(targetPath)) && (await hashDirectory(targetPath)) !== record.contentHash
+    // to lose — the pipeline simply recreates it. A hashing failure (an
+    // unreadable directory, or one deleted between the existence probe and
+    // the hash) surfaces as a structured fs InstallError — the client-localizes-
+    // by-code contract — never a bare Error that would become a codeless 500.
+    let localModified = false
+    if (await pathExists(targetPath)) {
+      try {
+        localModified = (await hashDirectory(targetPath)) !== record.contentHash
+      } catch (error) {
+        throw toInstallError(error)
+      }
+    }
     if (request.confirm !== true) {
       return {
         status: 'confirmation-required',
