@@ -65,6 +65,7 @@ type DictKey =
   | 'installed.installedAt'
   | 'installed.badge.update'
   | 'installed.badge.invalid'
+  | 'installed.latest'
   | 'check.button'
   | 'check.busy'
   | 'check.failed'
@@ -127,6 +128,7 @@ const DICT: Record<'zh' | 'en', Record<DictKey, string>> = {
     'installed.installedAt': '安装时间',
     'installed.badge.update': '有更新',
     'installed.badge.invalid': 'Source 失效',
+    'installed.latest': '已是最新',
     'check.button': '检查更新',
     'check.busy': '检查中…',
     'check.failed': '检查更新失败：{message}',
@@ -181,6 +183,7 @@ const DICT: Record<'zh' | 'en', Record<DictKey, string>> = {
     'installed.installedAt': 'Installed',
     'installed.badge.update': 'Update available',
     'installed.badge.invalid': 'Source invalid',
+    'installed.latest': 'Up to date',
     'check.button': 'Check for updates',
     'check.busy': 'Checking…',
     'check.failed': 'Update check failed: {message}',
@@ -523,7 +526,8 @@ function InstalledSkillItem(props: {
   record: RegistryRecord
   updateState?: SkillUpdateState
   t: TranslateNS<typeof NS>
-  onChanged: () => void
+  onUpdated: () => void
+  onUninstalled: () => void
   onConfirm: (prompt: Omit<ConfirmPromptState, 'busy'>) => void
 }): ReactNode {
   const { record, updateState, t } = props
@@ -531,6 +535,11 @@ function InstalledSkillItem(props: {
   // The fresh check outcome wins over the record's persisted flag.
   const sourceInvalid = updateState?.sourceInvalid ?? record.sourceInvalid === true
   const updateAvailable = updateState?.updateAvailable === true && !sourceInvalid
+  // Three update states: 未检查 (no entry, button stays enabled — a direct
+  // forced update is a legitimate path), 有更新 (badge + enabled), 已是最新
+  // (checked clean or just updated; text + disabled). A failed check keeps
+  // the row in its error copy instead of reading as 已是最新.
+  const isLatest = updateState !== undefined && updateState.error === undefined && !updateAvailable && !sourceInvalid
 
   /** Known host error codes map to localized DICT copy; anything else shows the raw message. */
   function localize(error: unknown): string {
@@ -565,7 +574,7 @@ function InstalledSkillItem(props: {
         return
       }
       setOp({ phase: 'idle' })
-      props.onChanged()
+      props.onUpdated()
     } catch (error) {
       setOp({ phase: 'error', op: 'update', message: localize(error) })
     }
@@ -592,7 +601,7 @@ function InstalledSkillItem(props: {
         return
       }
       setOp({ phase: 'idle' })
-      props.onChanged()
+      props.onUninstalled()
     } catch (error) {
       setOp({ phase: 'error', op: 'uninstall', message: localize(error) })
     }
@@ -627,7 +636,7 @@ function InstalledSkillItem(props: {
             {
               className: 'skm-btn',
               type: 'button',
-              disabled: busy || sourceInvalid,
+              disabled: busy || sourceInvalid || isLatest,
               onClick: () => void doUpdate(false),
             },
             busy && op.op === 'update' ? t('update.busy') : t('update.button'),
@@ -647,6 +656,7 @@ function InstalledSkillItem(props: {
       h('h3', { className: 'skm-name' }, record.skillId),
       updateAvailable ? h('span', { className: 'skm-badge skm-badge-update' }, t('installed.badge.update')) : null,
       sourceInvalid ? h('span', { className: 'skm-badge skm-badge-invalid' }, t('installed.badge.invalid')) : null,
+      isLatest ? h('span', { className: 'skm-note' }, t('installed.latest')) : null,
     ),
     h(
       'div',
@@ -726,8 +736,17 @@ function SkillManagerSection(props: { t: TranslateNS<typeof NS> }): ReactNode {
     }
   }
 
-  /** An installed item finished an update/uninstall: drop its stale check state and re-read the records. */
-  function handleItemChanged(skillId: string): void {
+  /** A successful update resolves the row to 已是最新: keep a check entry with updateAvailable cleared (created if the update ran without a prior check). */
+  function handleItemUpdated(record: RegistryRecord): void {
+    setUpdateStates((previous) => ({
+      ...previous,
+      [record.skillId]: { skillId: record.skillId, source: record.source, updateAvailable: false, sourceInvalid: false },
+    }))
+    void refreshInstalled()
+  }
+
+  /** An uninstall removes the row outright: drop its check state and re-read the records. */
+  function handleItemUninstalled(skillId: string): void {
     setUpdateStates((previous) => {
       if (!(skillId in previous)) return previous
       const next = { ...previous }
@@ -855,7 +874,8 @@ function SkillManagerSection(props: { t: TranslateNS<typeof NS> }): ReactNode {
               record,
               updateState: updateStates[record.skillId],
               t,
-              onChanged: () => handleItemChanged(record.skillId),
+              onUpdated: () => handleItemUpdated(record),
+              onUninstalled: () => handleItemUninstalled(record.skillId),
               onConfirm: (next) => setPrompt({ ...next, busy: false }),
             }),
           ),
