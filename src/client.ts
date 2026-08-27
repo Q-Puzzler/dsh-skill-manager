@@ -2,7 +2,8 @@
  * Client half of the plugin: the Catalog search settings section plus the
  * installed-skills section below it. A thin shell (ADR-0005) — it renders
  * state and forwards intent to the host HTTP endpoints with ordinary relative
- * fetch; all logic lives host-side.
+ * fetch (15s timeout — a hung request degrades to the localized error + retry
+ * surface, never a permanent busy state); all logic lives host-side.
  *
  * Per-result install buttons (安装 / 安装中 / 已安装→重装 / 失败重试) drive
  * the two-phase Confirmation protocol (ADR-0004): a confirmation-required
@@ -42,6 +43,7 @@ type DictKey =
   | 'search.placeholder'
   | 'search.button'
   | 'search.busy'
+  | 'search.count'
   | 'state.initial'
   | 'state.empty'
   | 'state.error'
@@ -74,6 +76,7 @@ type DictKey =
   | 'uninstall.failed'
   | 'error.not-managed'
   | 'error.source-invalid'
+  | 'error.timeout'
   | 'confirm.title'
   | 'confirm.skill'
   | 'confirm.source'
@@ -102,6 +105,7 @@ const DICT: Record<'zh' | 'en', Record<DictKey, string>> = {
     'search.placeholder': '输入关键词，如 pdf、frontend',
     'search.button': '搜索',
     'search.busy': '搜索中…',
+    'search.count': '共 {count} 条',
     'state.initial': '输入关键词，从 skills.sh Catalog 搜索技能。',
     'state.empty': '没有找到与“{keyword}”匹配的技能。',
     'state.error': '搜索失败：{message}',
@@ -134,6 +138,7 @@ const DICT: Record<'zh' | 'en', Record<DictKey, string>> = {
     'uninstall.failed': '卸载失败：{message}',
     'error.not-managed': '该技能不受本插件管理，操作已拒绝。',
     'error.source-invalid': 'Source 已失效，无法更新；仍可卸载。',
+    'error.timeout': '网络请求超时，请重试。',
     'confirm.title': '确认{action}',
     'confirm.skill': '技能',
     'confirm.source': '来源',
@@ -154,6 +159,7 @@ const DICT: Record<'zh' | 'en', Record<DictKey, string>> = {
     'search.placeholder': 'Keyword, e.g. pdf, frontend',
     'search.button': 'Search',
     'search.busy': 'Searching…',
+    'search.count': '{count} results',
     'state.initial': 'Enter a keyword to search the skills.sh Catalog.',
     'state.empty': 'No skills matched “{keyword}”.',
     'state.error': 'Search failed: {message}',
@@ -186,6 +192,7 @@ const DICT: Record<'zh' | 'en', Record<DictKey, string>> = {
     'uninstall.failed': 'Uninstall failed: {message}',
     'error.not-managed': 'This skill is not managed by the plugin; the operation was refused.',
     'error.source-invalid': 'The Source is invalid; update is unavailable. Uninstall remains possible.',
+    'error.timeout': 'The request timed out; please try again.',
     'confirm.title': 'Confirm {action}',
     'confirm.skill': 'Skill',
     'confirm.source': 'Source',
@@ -238,13 +245,33 @@ class ApiError extends Error {
 }
 
 async function callApi<T>(path: string, init?: { method?: 'GET' | 'POST'; body?: unknown }): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    method: init?.method ?? 'GET',
-    ...(init?.body !== undefined
-      ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(init.body) }
-      : {}),
-  })
-  const body = (await response.json().catch(() => undefined)) as ApiEnvelope<T> | undefined
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      method: init?.method ?? 'GET',
+      // Hung requests must not pin the UI on a busy/loading state forever.
+      signal: AbortSignal.timeout(15_000),
+      ...(init?.body !== undefined
+        ? { headers: { 'content-type': 'application/json' }, body: JSON.stringify(init.body) }
+        : {}),
+    })
+  } catch (error) {
+    // The browser's timeout/abort DOMException carries an English message;
+    // wrap it so the catch sites can localize via the 'timeout' code.
+    if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+      throw new ApiError(error.message, 'timeout')
+    }
+    throw error
+  }
+  // The timeout signal also governs body streaming: if the response head
+  // arrives in time but the body stalls, response.json() rejects with the
+  // same DOMException — map it to 'timeout' instead of a bogus "HTTP 200".
+  const body = (await response.json().catch((error: unknown) => {
+    if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+      throw new ApiError(error.message, 'timeout')
+    }
+    return undefined
+  })) as ApiEnvelope<T> | undefined
   if (!response.ok || body?.ok !== true || body.data === undefined) {
     throw new ApiError(body?.error ?? `HTTP ${response.status}`, body?.code)
   }
@@ -264,6 +291,7 @@ const CSS = `
 .skm-note{margin:0;font-size:13px;color:var(--dsw-alias-label-tertiary)}
 .skm-error{margin:0;font-size:13px;color:var(--dsw-alias-state-error-primary)}
 .skm-results{display:flex;flex-direction:column;gap:12px;margin:0;padding:0;list-style:none}
+.skm-results-scroll{max-height:24rem;overflow-y:auto}
 .skm-result{display:flex;flex-direction:column;gap:4px;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-2)}
 .skm-name{margin:0;font-size:14px;font-weight:600}
 .skm-meta{display:flex;flex-wrap:wrap;gap:4px 12px;font-size:12px;color:var(--dsw-alias-label-tertiary)}
@@ -303,6 +331,12 @@ interface ConfirmPromptState {
   warning?: string
   busy: boolean
   proceed: () => Promise<void>
+}
+
+/** Shared catch-site mapping: a callApi timeout gets localized copy instead of the browser's English DOMException message. */
+function apiErrorMessage(error: unknown, t: TranslateNS<typeof NS>): string {
+  if (error instanceof ApiError && error.code === 'timeout') return t('error.timeout')
+  return error instanceof Error ? error.message : String(error)
 }
 
 /** Confirmation modal: skill, Source, target path, action, 确认/取消. */
@@ -429,9 +463,7 @@ function SearchResultItem(props: {
       const message =
         error instanceof ApiError && error.code === 'skill-not-found'
           ? t('install.error.skill-not-found')
-          : error instanceof Error
-            ? error.message
-            : String(error)
+          : apiErrorMessage(error, t)
       setInstall({ phase: 'error', message })
     }
   }
@@ -506,6 +538,7 @@ function InstalledSkillItem(props: {
       if (error.code === 'not-managed') return t('error.not-managed')
       if (error.code === 'source-invalid') return t('error.source-invalid')
       if (error.code === 'skill-not-found') return t('install.error.skill-not-found')
+      if (error.code === 'timeout') return t('error.timeout')
     }
     return error instanceof Error ? error.message : String(error)
   }
@@ -648,7 +681,7 @@ function SkillManagerSection(props: { t: TranslateNS<typeof NS> }): ReactNode {
     } catch (error) {
       // The installed section surfaces the failure (with retry); the search
       // results degrade to plain install buttons — no ready records to match.
-      setInstalled({ phase: 'error', message: error instanceof Error ? error.message : String(error) })
+      setInstalled({ phase: 'error', message: apiErrorMessage(error, t) })
     }
   }
   useEffect(() => {
@@ -668,7 +701,7 @@ function SkillManagerSection(props: { t: TranslateNS<typeof NS> }): ReactNode {
       setState({
         phase: 'error',
         keyword: trimmed,
-        message: error instanceof Error ? error.message : String(error),
+        message: apiErrorMessage(error, t),
       })
     } finally {
       inflightRef.current = false
@@ -687,7 +720,7 @@ function SkillManagerSection(props: { t: TranslateNS<typeof NS> }): ReactNode {
       setUpdateStates(next)
       await refreshInstalled()
     } catch (error) {
-      setCheckError(error instanceof Error ? error.message : String(error))
+      setCheckError(apiErrorMessage(error, t))
     } finally {
       setCheckBusy(false)
     }
@@ -717,7 +750,12 @@ function SkillManagerSection(props: { t: TranslateNS<typeof NS> }): ReactNode {
   }
 
   const loading = state.phase === 'loading'
-  const installedSet = installed.phase === 'ready' ? new Set(installed.records.map((record) => record.skillId)) : null
+  // Installed match key: Source + Skill ID ('\n' cannot appear in either) —
+  // same-named Skills from different Sources must not read as installed. Both
+  // sides carry the Catalog's `owner/repo` string verbatim (the install
+  // pipeline stores request.source unchanged), so direct equality holds.
+  const installedSet =
+    installed.phase === 'ready' ? new Set(installed.records.map((record) => record.source + '\n' + record.skillId)) : null
   const nodes: ReactNode[] = [
     h('style', { key: 'css' }, CSS),
     h('h2', { key: 'title', className: 'skm-title' }, t('title')),
@@ -760,14 +798,15 @@ function SkillManagerSection(props: { t: TranslateNS<typeof NS> }): ReactNode {
     nodes.push(h('p', { key: 'state', className: 'skm-note', role: 'status' }, t('state.empty', { keyword: state.keyword })))
   } else {
     nodes.push(
+      h('p', { key: 'count', className: 'skm-note', role: 'status' }, t('search.count', { count: state.skills.length })),
       h(
         'ul',
-        { key: 'state', className: 'skm-results' },
+        { key: 'state', className: 'skm-results skm-results-scroll' },
         state.skills.map((item) =>
           h(SearchResultItem, {
             key: item.pageUrl,
             item,
-            installed: installedSet?.has(item.skillId) ?? false,
+            installed: installedSet?.has(item.source + '\n' + item.skillId) ?? false,
             t,
             onInstalled: () => void refreshInstalled(),
             onConfirm: (next) => setPrompt({ ...next, busy: false }),
