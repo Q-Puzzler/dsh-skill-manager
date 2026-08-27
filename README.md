@@ -8,9 +8,9 @@ Tested against dsh **0.1.1-rc.2** (dsh 0.1.x is a preview series with no semver 
 
 - **Search & browse the Catalog** — keyword search from the settings page; each result shows the skill name, install count, a lazily loaded description (from the Source's `SKILL.md` frontmatter), and a link to its skills.sh page.
 - **Install** — one-click install into the dsh Skills Directory (`~/.dsh/skills`), discovered by dsh without a restart. Already-managed skills show as installed; reinstalling a Managed Skill and overwriting an Unmanaged same-named directory both require an explicit two-phase Confirmation.
-- **Manage installed skills** — list of Managed Skills (name, Source, install time), one-click update checks against the Source's latest commit, update and uninstall (both behind Confirmation). Skills with a newer upstream commit carry an **Update Available** badge; skills whose Source no longer contains them carry a **Source Invalid** badge (local copy keeps working, updates disabled, uninstall still allowed).
+- **Manage installed skills** — list of Managed Skills (name, Source, install time), one-click update checks against the Source's latest commit, update and uninstall (both behind Confirmation). Skills with a newer upstream commit carry an **Update Available** badge; skills whose Source is gone or no longer contains them carry a **Source Invalid** badge (local copy keeps working, updates disabled, uninstall still allowed).
 - **Local modification warning** — if you edited a Managed Skill's files, the update Confirmation warns that your changes will be overwritten.
-- **Path safety** — every write is confined to the Skills Directory, enforced on the host side: Skill ID and Source segments are validated against the dsh name grammar, tarball entries are filtered (no path traversal, absolute paths, or symlinks), and the plugin never touches directories it does not manage.
+- **Path safety** — every write is confined to the Skills Directory, enforced on the host side: Skill IDs are validated against the dsh name grammar and Source segments against GitHub's owner/repo rules, tarball entries are filtered (no path traversal, absolute paths, or symlinks), and the plugin never touches directories it does not manage.
 
 ## Installation
 
@@ -66,3 +66,7 @@ pnpm test        # vitest run
 
 - `CONTEXT.md` — domain language (Catalog, Source, Managed Skill, Registry, …)
 - `docs/adr/` — architecture decisions (download bridge, Registry, description source, confirmation, host/client seam, HTTP routes)
+
+## License
+
+[Apache-2.0](LICENSE)
