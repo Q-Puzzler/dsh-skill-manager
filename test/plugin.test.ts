@@ -1,14 +1,15 @@
-import { homedir } from 'node:os'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { apply, Config, inject, name } from '../src/index'
+import { apply, Config, name, ROUTE_PREFIX } from '../src/index'
 
 describe('plugin exports', () => {
-  it('exposes the cordis four-export shape', () => {
+  it('exposes the cordis plugin shape (no static inject — webServer is a soft dependency)', () => {
     expect(name).toBe('skill-manager')
     expect(typeof apply).toBe('function')
-    expect(inject).toEqual(['webServer'])
   })
 
   it('Config is a schemastery schema that parses defaults', () => {
@@ -34,5 +35,112 @@ describe('plugin exports', () => {
 
   it('honors a Config override for the Skills Directory', () => {
     expect(Config({ skillsDir: '/tmp/custom-skills' }).skillsDir).toBe('/tmp/custom-skills')
+  })
+})
+
+describe('webServer soft dependency', () => {
+  const tempDirs: string[] = []
+
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+  })
+
+  async function testConfig(): Promise<ReturnType<typeof Config>> {
+    const skillsDir = await mkdtemp(join(tmpdir(), 'skm-plugin-test-'))
+    tempDirs.push(skillsDir)
+    return Config({ skillsDir })
+  }
+
+  function captureWarnings(ctx: Context): unknown[] {
+    const warnings: unknown[] = []
+    ctx.logger.exporter({
+      // cordis drops messages above the threshold (default INFO=1); WARN is 2.
+      levels: { default: 3 },
+      export(message) {
+        if (message.type === 'warn') warnings.push(message.args[0])
+      },
+    })
+    return warnings
+  }
+
+  it('registers the route prefix when webServer is provided', async () => {
+    const ctx = new Context()
+    const register = vi.fn().mockReturnValue(() => {})
+    ctx.provide('webServer', { register } as unknown as Context['webServer'])
+    const warnings = captureWarnings(ctx)
+    const fiber = await ctx.plugin({ name, apply }, await testConfig())
+    // The nested ctx.inject fiber loads asynchronously after apply returns.
+    await vi.waitFor(() => expect(register).toHaveBeenCalledTimes(1))
+    expect(register.mock.calls[0]?.[0]).toMatchObject({ kind: 'prefix', path: ROUTE_PREFIX })
+    expect(warnings).toEqual([])
+    await fiber.dispose()
+  })
+
+  it('activates without webServer: no routes, no throw, one warning', async () => {
+    const ctx = new Context()
+    const warnings = captureWarnings(ctx)
+    const fiber = await ctx.plugin({ name, apply }, await testConfig())
+    // The entry fiber itself is ACTIVE (2) — it never pends on webServer, so a
+    // WebUI-less profile boots fine; the plugin simply stays inactive.
+    expect(fiber.state).toBe(2)
+    expect(ctx.get('webServer')).toBeUndefined()
+    expect(warnings).toHaveLength(1)
+    expect(String(warnings[0])).toContain('webServer')
+    await fiber.dispose()
+  })
+
+  // The deferred branch is the real dsh path: a loader service is present and
+  // the warning check rides loader.await(), past concurrent entry startup.
+  describe('deferred check (loader present)', () => {
+    function provideFakeLoader(ctx: Context): void {
+      ctx.provide('loader', { await: () => Promise.resolve() })
+    }
+
+    it('webServer provided before the loader settles: routes registered, no warning', async () => {
+      const ctx = new Context()
+      provideFakeLoader(ctx)
+      const register = vi.fn().mockReturnValue(() => {})
+      ctx.provide('webServer', { register } as unknown as Context['webServer'])
+      const warnings = captureWarnings(ctx)
+      const fiber = await ctx.plugin({ name, apply }, await testConfig())
+      await vi.waitFor(() => expect(register).toHaveBeenCalledTimes(1))
+      expect(register.mock.calls[0]?.[0]).toMatchObject({ kind: 'prefix', path: ROUTE_PREFIX })
+      // Let the deferred check (loader.await() → check → await routes) settle.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(warnings).toEqual([])
+      await fiber.dispose()
+    })
+
+    it('webServer never provided: exactly one warning after the loader settles', async () => {
+      const ctx = new Context()
+      provideFakeLoader(ctx)
+      const warnings = captureWarnings(ctx)
+      const fiber = await ctx.plugin({ name, apply }, await testConfig())
+      await vi.waitFor(() => expect(warnings).toHaveLength(1))
+      expect(String(warnings[0])).toContain('webServer')
+      // Settle every queued microtask: the check must fire exactly once.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(warnings).toHaveLength(1)
+      await fiber.dispose()
+    })
+
+    it('webServer present but the nested fiber fails (register throws): one failure warning', async () => {
+      const ctx = new Context()
+      provideFakeLoader(ctx)
+      const register = vi.fn(() => {
+        throw new Error('boom')
+      })
+      ctx.provide('webServer', { register } as unknown as Context['webServer'])
+      const warnings = captureWarnings(ctx)
+      const fiber = await ctx.plugin({ name, apply }, await testConfig())
+      // cordis logs the raw error and parks the nested fiber in FAILED; the
+      // deferred check re-surfaces the failure as a warning — the boot stays
+      // green, but the silent-routes regression is observable.
+      await vi.waitFor(() => expect(warnings).toHaveLength(1))
+      expect(String(warnings[0])).toContain('failed to register')
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(warnings).toHaveLength(1)
+      await fiber.dispose()
+    })
   })
 })

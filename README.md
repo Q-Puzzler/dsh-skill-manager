@@ -53,6 +53,11 @@ dsh --profile web --dump-config
 
 The output should contain a `skill-manager` layer (`# == @q-puzzler/dsh-skill-manager` and `- id: skill-manager`). Then restart `dsh web` and hard-refresh the browser — a **Skill Manager** section appears in the settings sidebar. The client bundle is served at `/plugins/@q-puzzler/dsh-skill-manager/client.js`.
 
+## Runtime requirements & expected warnings
+
+- **WebUI profile required.** This plugin's entire surface lives in the dsh WebUI (host routes on the `webServer` service, a settings section in the client), so install it into a profile that provides `webServer` — e.g. the `web` profile. Installing it into a profile **without** a WebUI is harmless: the plugin activates but stays idle (no routes registered, nothing mounted), the profile boots normally, and the host log carries one warning that `webServer` is unavailable and the plugin requires a WebUI-enabled profile.
+- **Expected pnpm peer warnings.** During install pnpm may print `missing peer` warnings for `@deepseek-ai/cordis` and the `@deepseek-ai/dsh-client-*` packages. These are expected and safe to ignore: they are declared as peer dependencies because dsh supplies them at runtime through its own module graph — they must not be installed into the plugin itself.
+
 ## Development
 
 ```bash
