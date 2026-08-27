@@ -88,4 +88,59 @@ describe('webServer soft dependency', () => {
     expect(String(warnings[0])).toContain('webServer')
     await fiber.dispose()
   })
+
+  // The deferred branch is the real dsh path: a loader service is present and
+  // the warning check rides loader.await(), past concurrent entry startup.
+  describe('deferred check (loader present)', () => {
+    function provideFakeLoader(ctx: Context): void {
+      ctx.provide('loader', { await: () => Promise.resolve() })
+    }
+
+    it('webServer provided before the loader settles: routes registered, no warning', async () => {
+      const ctx = new Context()
+      provideFakeLoader(ctx)
+      const register = vi.fn().mockReturnValue(() => {})
+      ctx.provide('webServer', { register } as unknown as Context['webServer'])
+      const warnings = captureWarnings(ctx)
+      const fiber = await ctx.plugin({ name, apply }, await testConfig())
+      await vi.waitFor(() => expect(register).toHaveBeenCalledTimes(1))
+      expect(register.mock.calls[0]?.[0]).toMatchObject({ kind: 'prefix', path: ROUTE_PREFIX })
+      // Let the deferred check (loader.await() → check → await routes) settle.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(warnings).toEqual([])
+      await fiber.dispose()
+    })
+
+    it('webServer never provided: exactly one warning after the loader settles', async () => {
+      const ctx = new Context()
+      provideFakeLoader(ctx)
+      const warnings = captureWarnings(ctx)
+      const fiber = await ctx.plugin({ name, apply }, await testConfig())
+      await vi.waitFor(() => expect(warnings).toHaveLength(1))
+      expect(String(warnings[0])).toContain('webServer')
+      // Settle every queued microtask: the check must fire exactly once.
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(warnings).toHaveLength(1)
+      await fiber.dispose()
+    })
+
+    it('webServer present but the nested fiber fails (register throws): one failure warning', async () => {
+      const ctx = new Context()
+      provideFakeLoader(ctx)
+      const register = vi.fn(() => {
+        throw new Error('boom')
+      })
+      ctx.provide('webServer', { register } as unknown as Context['webServer'])
+      const warnings = captureWarnings(ctx)
+      const fiber = await ctx.plugin({ name, apply }, await testConfig())
+      // cordis logs the raw error and parks the nested fiber in FAILED; the
+      // deferred check re-surfaces the failure as a warning — the boot stays
+      // green, but the silent-routes regression is observable.
+      await vi.waitFor(() => expect(warnings).toHaveLength(1))
+      expect(String(warnings[0])).toContain('failed to register')
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      expect(warnings).toHaveLength(1)
+      await fiber.dispose()
+    })
+  })
 })

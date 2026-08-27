@@ -12,10 +12,15 @@
  * nested `ctx.inject(['webServer'], …)` fiber instead: this entry activates
  * in every profile, routes appear whenever webServer does (and disappear if
  * it goes away), and a WebUI-less profile only gets one deferred warning.
+ *
+ * Trade-off: a failure inside the nested fiber (SkillManager construction or
+ * webServer.register throwing) no longer fails the profile boot — cordis
+ * logs the raw error and parks the fiber in FAILED. warnIfNoWebServer
+ * re-surfaces that failure as a warning once the loader tree settles.
  */
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import type { Context } from '@deepseek-ai/cordis'
+import type { Context, Fiber } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import Schema from '@deepseek-ai/schemastery'
 import { InstallError } from './install'
@@ -138,8 +143,8 @@ async function readJsonBody(req: import('node:http').IncomingMessage): Promise<u
 }
 
 export function apply(ctx: Context, config: Config): void {
-  ctx.inject(['webServer'], (routeCtx) => registerRoutes(routeCtx, config))
-  warnIfNoWebServer(ctx)
+  const routes = ctx.inject(['webServer'], (routeCtx) => registerRoutes(routeCtx, config))
+  warnIfNoWebServer(ctx, routes)
 }
 
 /** Register every endpoint once webServer is available (soft dependency, #12). */
@@ -311,24 +316,39 @@ interface LoaderLike {
 }
 
 /**
- * Emit one warning when the profile settles without webServer. The check is
+ * Emit one warning when the profile settles without webServer — or when the
+ * nested route fiber FAILED even though webServer is present (a FAILED fiber
+ * does not fail the boot; cordis only logs the raw error). The check is
  * deferred through the loader tree because entries start concurrently — at
  * apply time webServer may simply not be active yet in a WebUI profile.
  * Without a loader (bare contexts, unit tests) the check runs immediately.
  */
-function warnIfNoWebServer(ctx: Context): void {
-  const warn = (): void => {
-    if (ctx.get('webServer') !== undefined) return
-    ctx
-      .logger(name)
-      .warn(
-        'webServer service is not available; skill-manager requires a WebUI-enabled profile (e.g. web) and stays inactive: no routes are registered',
-      )
+function warnIfNoWebServer(ctx: Context, routes: Fiber & PromiseLike<Fiber>): void {
+  const check = async (): Promise<void> => {
+    if (ctx.get('webServer') === undefined) {
+      ctx
+        .logger(name)
+        .warn(
+          'webServer service is not available; skill-manager requires a WebUI-enabled profile (e.g. web) and stays inactive: no routes are registered',
+        )
+      return
+    }
+    // webServer is present, so the nested fiber is at least LOADING (its
+    // dependency check runs synchronously on provide): awaiting it drains the
+    // load and rethrows a startup error. A PENDING fiber is impossible here,
+    // so a not-yet-provided webServer can never trip this branch.
+    try {
+      await routes
+    } catch (error) {
+      ctx
+        .logger(name)
+        .warn('skill-manager failed to register its routes on webServer; the plugin stays inactive', error)
+    }
   }
   const loader = ctx.get('loader') as LoaderLike | undefined
   if (loader === undefined) {
-    warn()
+    void check()
     return
   }
-  void loader.await().then(warn, () => {})
+  void loader.await().then(check, () => {})
 }
