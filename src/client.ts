@@ -263,7 +263,15 @@ async function callApi<T>(path: string, init?: { method?: 'GET' | 'POST'; body?:
     }
     throw error
   }
-  const body = (await response.json().catch(() => undefined)) as ApiEnvelope<T> | undefined
+  // The timeout signal also governs body streaming: if the response head
+  // arrives in time but the body stalls, response.json() rejects with the
+  // same DOMException — map it to 'timeout' instead of a bogus "HTTP 200".
+  const body = (await response.json().catch((error: unknown) => {
+    if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+      throw new ApiError(error.message, 'timeout')
+    }
+    return undefined
+  })) as ApiEnvelope<T> | undefined
   if (!response.ok || body?.ok !== true || body.data === undefined) {
     throw new ApiError(body?.error ?? `HTTP ${response.status}`, body?.code)
   }
