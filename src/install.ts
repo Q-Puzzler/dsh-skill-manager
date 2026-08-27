@@ -30,12 +30,21 @@ import type { SourceRef } from './validation'
 const gunzip = promisify(gunzipCallback)
 
 /** Install failure categories; the HTTP route maps each to a status code. */
-export type InstallErrorCode = 'invalid-input' | 'skill-not-found' | 'unsafe-archive' | 'upstream' | 'fs'
+export type InstallErrorCode =
+  | 'invalid-input'
+  | 'skill-not-found'
+  | 'not-managed'
+  | 'source-invalid'
+  | 'unsafe-archive'
+  | 'upstream'
+  | 'fs'
 
 export class InstallError extends Error {
   constructor(
     readonly code: InstallErrorCode,
     message: string,
+    /** HTTP status of the failing upstream response, when there was one. */
+    readonly status?: number,
   ) {
     super(message)
     this.name = 'InstallError'
@@ -109,6 +118,24 @@ async function fetchFirstCommitSha(
   return typeof sha === 'string' && sha !== '' ? sha : undefined
 }
 
+/**
+ * The update-check lookup: the latest default-branch commit touching the
+ * Skill's path (repo-root layout answers HEAD itself). Unlike the install-time
+ * resolvePathCommit this THROWS on failure (an InstallError whose `status`
+ * marks 404-class responses) so the caller can tell a dead Source apart from
+ * a transient one; undefined means the path has no commits at all — the
+ * Source no longer contains the Skill.
+ */
+export async function queryLatestCommit(
+  options: InstallNetworkOptions,
+  ref: SourceRef,
+  skillPath: string,
+): Promise<string | undefined> {
+  const { headSha, defaultBranch } = await resolveHead(options, ref)
+  if (skillPath === '') return headSha
+  return fetchFirstCommitSha(options, ref, new URLSearchParams({ sha: defaultBranch, path: skillPath, per_page: '1' }))
+}
+
 /** Download `codeload .../tar.gz/<sha>` and gunzip it into the tar buffer. */
 export async function downloadTarball(options: InstallNetworkOptions, ref: SourceRef, sha: string): Promise<Buffer> {
   const url = `${options.githubCodeloadBase}/${ref.owner}/${ref.repo}/tar.gz/${sha}`
@@ -118,7 +145,7 @@ export async function downloadTarball(options: InstallNetworkOptions, ref: Sourc
   } catch (error) {
     throw new InstallError('upstream', `tarball download failed: ${errorMessage(error)}`)
   }
-  if (!response.ok) throw new InstallError('upstream', `tarball download failed: HTTP ${response.status}`)
+  if (!response.ok) throw new InstallError('upstream', `tarball download failed: HTTP ${response.status}`, response.status)
   let gz: Buffer
   try {
     gz = Buffer.from(await response.arrayBuffer())
@@ -373,7 +400,7 @@ async function fetchJson(options: InstallNetworkOptions, url: string): Promise<u
   } catch (error) {
     throw new InstallError('upstream', `GitHub API request failed: ${errorMessage(error)}`)
   }
-  if (!response.ok) throw new InstallError('upstream', `GitHub API request failed: HTTP ${response.status} (${url})`)
+  if (!response.ok) throw new InstallError('upstream', `GitHub API request failed: HTTP ${response.status} (${url})`, response.status)
   try {
     return JSON.parse(await response.text())
   } catch {

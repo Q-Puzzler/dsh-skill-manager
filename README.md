@@ -2,7 +2,17 @@
 
 A DeepSeek Harness (dsh) plugin for browsing, installing, updating and uninstalling skills from [skills.sh](https://www.skills.sh/), with a dedicated entry in the dsh WebUI settings.
 
-> Work in progress. 当前进度：T3（安装技能，端到端）已完成——每条搜索结果提供安装入口，一键落入 Skills Directory（dsh 无需重启即可发现），每次安装写入 Registry 记录；Managed 结果显示「已安装」，重装与覆盖 Unmanaged 同名目录均走两段式 Confirmation（host 强制，未确认零写入）。更新/卸载将在后续 ticket 落地。
+> Work in progress. 当前进度：T4（已安装技能管理——列表、卸载、更新，端到端）已完成——设置页新增已安装区块（名称、Source、安装时间、空态），一键检查更新（commit SHA 比对 → Update Available badge；404 类响应 → Source Invalid badge：禁更新、保卸载），更新复用安装管线原子替换（本地修改在确认流中警告，任何失败保留旧版本与 Registry），卸载经两段式 Confirmation 删除目录与 Registry 记录、Unmanaged 目标一律拒绝。
+
+## 功能（T4）
+
+在 T3 基础上新增：
+
+- `POST /skill-manager/api/check-updates`：对每个 Registry 记录查询 Source 默认分支上该技能路径的最新 commit（GitHub API，与安装同款 helper），与记录的 commitSha 比对 → 每技能 `{updateAvailable, sourceInvalid, latestCommitSha?, error?}`。404/410 或路径无 commit → sourceInvalid 并**持久化到记录**（list-installed 直接带 badge、update 无需联网即可拒绝；健康复查自动清除）；其他网络/上游失败 → 每技能可重试 error，不标记失效。逐技能检查串行经过与安装/更新/卸载相同的 per-skill 互斥锁，网络并发受 fetchConcurrency 上限约束。
+- `POST /skill-manager/api/update`（body `{skillId, confirm?}`）：两段式 Confirmation——确认前重算目录内容哈希，与记录不符即本地修改，confirmation-required 响应携带 `localModified: true`（确认门在任何网络/写入之前）。记录 sourceInvalid → 409 拒绝（卸载仍可用）；无记录 → not-managed 拒绝。确认后复用安装管线（解析 HEAD → tarball → 白名单解出 → 暂存 → 备份换入，失败回滚），刷新记录（commitSha、contentHash、新增 updatedAt；installedAt 保留、sourceInvalid 清除）；任何失败保留旧版本与 Registry 不变。
+- `POST /skill-manager/api/uninstall`（body `{skillId, confirm?}`）：零网络。只作用于 Registry 登记目标——重新校验 skillId 语法 + 目标路径 resolve 前缀校验；无记录 → not-managed 结构化错误（绝不删除 Unmanaged 目录）；目录缺失但记录在 → 仅删记录（良性）。先删目录后删记录，记录删除失败重试可自愈。
+- Registry 记录新增可选字段：`sourceInvalid`（持久化的 Source 失效标记）、`updatedAt`（最近更新时间；installedAt 始终为首次安装时间）。
+- 设置页：搜索区下方新增已安装区块——Managed Skill 列表（名称、Source、安装时间）、空态、加载失败可重试；全局「检查更新」按钮（在途防重）；Update Available / Source Invalid badge（Source Invalid 禁用更新、保留卸载）；每行更新/卸载按钮复用共享 ConfirmModal（更新弹窗在本地修改时显示覆盖警告）；host 错误按 code 本地化（not-managed / source-invalid / skill-not-found）。中文文案 + en 镜像。
 
 ## 功能（T3）
 

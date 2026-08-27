@@ -94,6 +94,8 @@ const MAX_BODY_BYTES = 64 * 1024
 const INSTALL_ERROR_STATUS: Record<InstallErrorCode, number> = {
   'invalid-input': 400,
   'skill-not-found': 404,
+  'not-managed': 404,
+  'source-invalid': 409,
   'unsafe-archive': 422,
   'upstream': 502,
   'fs': 500,
@@ -216,6 +218,64 @@ export function apply(ctx: Context, config: Config): void {
                 if (error instanceof InstallError) {
                   // `code` rides along so the client maps its own localized
                   // copy (host messages stay English by convention).
+                  json(res, INSTALL_ERROR_STATUS[error.code], { ok: false, code: error.code, error: error.message })
+                  return
+                }
+                throw error
+              }
+              return
+            }
+            if (path === `${ROUTE_PREFIX}/check-updates`) {
+              // POST, not GET: the check persists sourceInvalid flag updates.
+              if (req.method !== 'POST') {
+                json(res, 405, { ok: false, error: `method not allowed: ${req.method}` })
+                return
+              }
+              const states = await service.checkUpdates()
+              json(res, 200, { ok: true, data: { skills: states } })
+              return
+            }
+            if (path === `${ROUTE_PREFIX}/update`) {
+              if (req.method !== 'POST') {
+                json(res, 405, { ok: false, error: `method not allowed: ${req.method}` })
+                return
+              }
+              const body = await readJsonBody(req)
+              const payload = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>
+              if (typeof payload.skillId !== 'string') {
+                json(res, 400, { ok: false, error: 'invalid JSON body: expected { skillId, confirm? }' })
+                return
+              }
+              try {
+                const result = await service.update({ skillId: payload.skillId, confirm: payload.confirm === true })
+                json(res, 200, { ok: true, data: result })
+              } catch (error) {
+                if (error instanceof InstallError) {
+                  // `code` rides along so the client maps its own localized
+                  // copy (host messages stay English by convention).
+                  json(res, INSTALL_ERROR_STATUS[error.code], { ok: false, code: error.code, error: error.message })
+                  return
+                }
+                throw error
+              }
+              return
+            }
+            if (path === `${ROUTE_PREFIX}/uninstall`) {
+              if (req.method !== 'POST') {
+                json(res, 405, { ok: false, error: `method not allowed: ${req.method}` })
+                return
+              }
+              const body = await readJsonBody(req)
+              const payload = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>
+              if (typeof payload.skillId !== 'string') {
+                json(res, 400, { ok: false, error: 'invalid JSON body: expected { skillId, confirm? }' })
+                return
+              }
+              try {
+                const result = await service.uninstall({ skillId: payload.skillId, confirm: payload.confirm === true })
+                json(res, 200, { ok: true, data: result })
+              } catch (error) {
+                if (error instanceof InstallError) {
                   json(res, INSTALL_ERROR_STATUS[error.code], { ok: false, code: error.code, error: error.message })
                   return
                 }

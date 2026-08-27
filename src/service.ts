@@ -1,20 +1,30 @@
 /**
- * SkillManager — the host-side service holding all Catalog search and Skill
- * install logic (ADR-0005: the single test seam). Plain class with injected
- * fetchers and an injected Skills Directory root, so tests run without
- * network and without touching the real `~/.dsh/skills`; the cordis plugin
- * (index.ts) wires it to HTTP.
+ * SkillManager — the host-side service holding all Catalog search, Skill
+ * install, and Managed-Skill lifecycle logic (ADR-0005: the single test
+ * seam). Plain class with injected fetchers and an injected Skills Directory
+ * root, so tests run without network and without touching the real
+ * `~/.dsh/skills`; the cordis plugin (index.ts) wires it to HTTP.
  *
- * Three data flows, honoring the exam's source constraints:
+ * Four data flows, honoring the exam's source constraints:
  * - search: only the Catalog is contacted (`GET <catalogUrl>/api/search?q=`).
  * - description: fetched lazily from the Source repository the Catalog entry
  *   itself names, via raw SKILL.md frontmatter; every failure degrades to the
- *   null sentinel (the UI shows its placeholder) — never an error state.
+ *   null sentinel (the UI shows its placeholder) — never an error state. An
+ *   all-404 probe additionally persists sourceInvalid on a Managed record
+ *   (the Source is provably gone); softer failures mark nothing.
  * - install: the ADR-0001 pipeline (commit resolution → codeload tarball →
  *   whitelist extraction → staging → atomic rename → Registry record) plus
  *   the two-phase Confirmation protocol (ADR-0004): reinstalls and Overwrites
  *   of Unmanaged directories require `confirm: true`, checked by the host
  *   before any network call or write.
+ * - manage: list-installed reads the Registry (the sole authority for
+ *   "managed"); check-updates compares each record's commitSha against the
+ *   Source's latest default-branch commit touching skillPath (404-class →
+ *   persisted sourceInvalid, other failures → retryable per-skill error);
+ *   update re-runs the pipeline with backup/rollback and refreshes the
+ *   record; uninstall removes the directory and record. Update and uninstall
+ *   are Confirmation-gated like install and only ever touch Registry-recorded
+ *   targets — an Unmanaged directory is never listed, updated, or deleted.
  */
 import { mkdir, rm, rename } from 'node:fs/promises'
 import { join, resolve, sep } from 'node:path'
@@ -27,6 +37,7 @@ import {
   hashDirectory,
   locateSkill,
   pathExists,
+  queryLatestCommit,
   resolveHead,
   resolvePathCommit,
   stagingPath,
@@ -34,9 +45,10 @@ import {
   writeStagedFiles,
 } from './install'
 import type { InstallNetworkOptions } from './install'
-import { listRecords, readRecord, registryDir, writeRecord } from './registry'
+import { listRecords, readRecord, registryDir, removeRecord, writeRecord } from './registry'
 import type { RegistryRecord } from './registry'
 import { isValidSkillId, parseSource } from './validation'
+import type { SourceRef } from './validation'
 
 /** Minimal structural subset of fetch/Response the service relies on. */
 export interface FetchResult {
@@ -98,6 +110,13 @@ export const DESCRIPTION_PROBE_PATHS = [
   () => 'SKILL.md',
 ] as const
 
+/** Outcome of probing a Skill's candidate SKILL.md paths. */
+interface DescriptionProbe {
+  description: string | null
+  /** Every candidate path answered 404/410 — the Source no longer contains the Skill. */
+  sourceGone: boolean
+}
+
 /** Thrown by search failures; the route maps it to an error response. */
 export class SearchError extends Error {}
 
@@ -134,6 +153,75 @@ export interface InstallSuccess {
 }
 
 export type InstallResult = InstallSuccess | ConfirmationRequired
+
+/** Shared request shape of the per-skill manage operations (update/uninstall). */
+export interface ManageRequest {
+  skillId: string
+  /** Second phase of the Confirmation protocol: explicit user approval. */
+  confirm?: boolean
+}
+
+/** First-phase manage response: the host refuses to mutate until re-called with confirm: true. */
+export interface ManageConfirmationRequired {
+  status: 'confirmation-required'
+  action: 'update' | 'uninstall'
+  skillId: string
+  source: string
+  targetPath: string
+  /**
+   * Update only: the on-disk content hash differs from the Registry — the
+   * Skill was modified locally and the update will overwrite that. Absent
+   * when the local copy is pristine (or the directory is missing).
+   */
+  localModified?: boolean
+}
+
+export interface UpdateSuccess {
+  status: 'updated'
+  action: 'update'
+  skillId: string
+  source: string
+  targetPath: string
+  /** Original install time (preserved across updates). */
+  installedAt: string
+  /** Time of this update. */
+  updatedAt: string
+  commitSha: string
+  contentHash: string
+  /** Non-fatal cleanup notice (same semantics as InstallSuccess.warning). */
+  warning?: string
+}
+
+export type UpdateResult = UpdateSuccess | ManageConfirmationRequired
+
+export interface UninstallSuccess {
+  status: 'uninstalled'
+  skillId: string
+  source: string
+  targetPath: string
+  /** False when only the record was removed (the directory was already missing). */
+  removedDirectory: boolean
+}
+
+export type UninstallResult = UninstallSuccess | ManageConfirmationRequired
+
+/** Per-skill outcome of one check-updates run. */
+export interface SkillUpdateState {
+  skillId: string
+  source: string
+  /** The Source's latest commit touching skillPath differs from the record's. */
+  updateAvailable: boolean
+  /**
+   * The Source answered a 404-class response or no longer contains the Skill.
+   * Persisted on the record, so the badge and update()'s refusal need no
+   * network; a later healthy check clears it again.
+   */
+  sourceInvalid: boolean
+  /** The latest commit found, when the check succeeded. */
+  latestCommitSha?: string
+  /** Transient per-skill failure (network, rate limit, 5xx); retryable — the record's flag is left untouched. */
+  error?: string
+}
 
 /** Bounded FIFO cache: oldest entries are evicted past the configured size. */
 class BoundedCache<V> {
@@ -195,8 +283,8 @@ export class SkillManager {
   private readonly cache: BoundedCache<string | null>
   private readonly pending = new Map<string, Promise<string | null>>()
   private readonly recordWriter: (skillsDir: string, record: RegistryRecord) => Promise<void>
-  /** Per-skill install mutex: skillId → tail of that skill's serialized install chain. */
-  private readonly installChains = new Map<string, Promise<void>>()
+  /** Per-skill mutation mutex: skillId → tail of that skill's serialized op chain. */
+  private readonly skillChains = new Map<string, Promise<void>>()
 
   constructor(options: SkillManagerOptions) {
     this.catalogUrl = options.catalogUrl.replace(/\/+$/, '')
@@ -249,6 +337,12 @@ export class SkillManager {
    * bounded by the concurrency semaphore and cached (negative outcomes too).
    * Returns the null sentinel on ANY failure — invalid input, all probe paths
    * missing, network errors — so the UI silently shows its placeholder.
+   * One side effect escapes the silence: when EVERY candidate path answers a
+   * 404-class response (the Source is gone or no longer contains the Skill)
+   * and the Skill is Managed, the record's sourceInvalid flag is persisted
+   * (the ticket's 404 → Source Invalid badge for the description flow too).
+   * Softer failures — a found SKILL.md without a description, a network
+   * error or non-404 status on any probe — mark nothing.
    */
   async fetchDescription(source: string, skillId: string): Promise<string | null> {
     const ref = parseSource(source)
@@ -259,32 +353,54 @@ export class SkillManager {
     if (pending !== undefined) return pending
     const task = this.semaphore
       .run(() => this.probeDescription(ref.owner, ref.repo, skillId))
-      .catch(() => null)
-      .then((description) => {
-        this.cache.set(key, description)
+      .catch((): DescriptionProbe => ({ description: null, sourceGone: false }))
+      .then(async (probe) => {
+        if (probe.sourceGone) await this.markSourceInvalid(skillId)
+        this.cache.set(key, probe.description)
         this.pending.delete(key)
-        return description
+        return probe.description
       })
     this.pending.set(key, task)
     return task
   }
 
   /** Probe the candidate SKILL.md paths in order; first hit wins. */
-  private async probeDescription(owner: string, repo: string, skillId: string): Promise<string | null> {
+  private async probeDescription(owner: string, repo: string, skillId: string): Promise<DescriptionProbe> {
+    // sourceGone survives only when EVERY probe answered 404/410: the Source
+    // is gone or no longer contains the Skill. Any network error or other
+    // status on any probe is a soft failure and clears it.
+    let sourceGone = true
     for (const buildPath of DESCRIPTION_PROBE_PATHS) {
       const url = `${this.githubRawBase}/${owner}/${repo}/HEAD/${buildPath(skillId)}`
       let response: FetchResult
       try {
         response = await this.fetcher(url, { signal: AbortSignal.timeout(this.fetchTimeoutMs) })
       } catch {
+        sourceGone = false
         continue
       }
-      if (!response.ok) continue
+      if (!response.ok) {
+        if (response.status !== 404 && response.status !== 410) sourceGone = false
+        continue
+      }
       // A found SKILL.md without a usable description ends the probe: the
       // Skill exists at this location and simply has no description to show.
-      return extractFrontmatterDescription(await response.text()) ?? null
+      return { description: extractFrontmatterDescription(await response.text()) ?? null, sourceGone: false }
     }
-    return null
+    return { description: null, sourceGone }
+  }
+
+  /**
+   * Description-probe side effect: every candidate path answered 404-class,
+   * so the Source no longer contains the Skill. Persist sourceInvalid when
+   * the Skill is Managed (an Unmanaged skill has no record to mark) via the
+   * same in-mutex re-read-and-flip write checkUpdates uses, so a concurrent
+   * uninstall/reinstall is never clobbered. Best-effort: a failed write
+   * just leaves the badge to the next checkUpdates run.
+   */
+  private async markSourceInvalid(skillId: string): Promise<void> {
+    const root = resolve(this.skillsDir)
+    await this.runSerialized(skillId, () => this.persistSourceInvalid(root, skillId, true))
   }
 
   /**
@@ -311,17 +427,25 @@ export class SkillManager {
    * is harmless and never rolls the install back.
    */
   async install(request: InstallRequest): Promise<InstallResult> {
-    const previous = this.installChains.get(request.skillId) ?? Promise.resolve()
-    const result = previous.then(() => this.installSerialized(request))
-    // The chain link swallows the outcome, so one failed install cannot jam
-    // the queue; each caller still sees their own result or rejection.
+    return this.runSerialized(request.skillId, () => this.installSerialized(request))
+  }
+
+  /**
+   * Serialize mutations of one skill: install, update, uninstall, and the
+   * registry-flag writes of checkUpdates all chain onto the same per-skill
+   * promise queue. The chain link swallows the outcome, so one failed op
+   * cannot jam the queue; each caller still sees their own result.
+   */
+  private runSerialized<T>(skillId: string, op: () => Promise<T>): Promise<T> {
+    const previous = this.skillChains.get(skillId) ?? Promise.resolve()
+    const result = previous.then(op)
     const link = result.then(
       () => undefined,
       () => undefined,
     )
-    this.installChains.set(request.skillId, link)
+    this.skillChains.set(skillId, link)
     void link.then(() => {
-      if (this.installChains.get(request.skillId) === link) this.installChains.delete(request.skillId)
+      if (this.skillChains.get(skillId) === link) this.skillChains.delete(skillId)
     })
     return result
   }
@@ -353,28 +477,64 @@ export class SkillManager {
         targetPath,
       }
     }
-    const network: InstallNetworkOptions = {
-      githubApiBase: this.githubApiBase,
-      githubCodeloadBase: this.githubCodeloadBase,
-      fetcher: this.fetcher,
-      binaryFetcher: this.binaryFetcher,
-      timeoutMs: this.installTimeoutMs,
+    const { record, warning } = await this.runPipeline(root, ref, request.source, request.skillId, {
+      source: request.source,
+      skillId: request.skillId,
+      installedAt: new Date().toISOString(),
+    })
+    return {
+      status: 'installed',
+      action,
+      skillId: request.skillId,
+      source: request.source,
+      targetPath,
+      installedAt: record.installedAt,
+      commitSha: record.commitSha,
+      contentHash: record.contentHash,
+      ...(warning !== undefined ? { warning } : {}),
     }
+  }
+
+  /**
+   * The shared ADR-0001 pipeline behind install and update: resolve HEAD →
+   * download tarball → locate the Skill subdirectory → whitelist extraction →
+   * stage inside the Skills Directory → atomic swap (an existing target is
+   * set aside as a backup) → content hash → path-commit resolution → Registry
+   * record. `record` carries the caller's own fields (source, skillId,
+   * installedAt, and update's updatedAt); the pipeline fills skillPath,
+   * commitSha, and contentHash.
+   *
+   * Any failure before the swap leaves zero partial files; a post-swap
+   * failure (hash, commit resolution, or the record write) rolls the previous
+   * directory back into place and leaves the previous Registry record
+   * untouched, so a failed update preserves the old version AND the old
+   * record. A successful run may carry a `warning` when non-fatal backup
+   * cleanup failed — residue there is harmless and never rolls the swap back.
+   */
+  private async runPipeline(
+    root: string,
+    ref: SourceRef,
+    source: string,
+    skillId: string,
+    record: Omit<RegistryRecord, 'skillPath' | 'commitSha' | 'contentHash'>,
+  ): Promise<{ record: RegistryRecord; warning?: string }> {
+    const network = this.networkOptions()
     const { headSha, defaultBranch } = await resolveHead(network, ref)
     const tar = await downloadTarball(network, ref, headSha)
-    const location = await locateSkill(tar, request.skillId)
+    const location = await locateSkill(tar, skillId)
     if (location === undefined) {
-      throw new InstallError('skill-not-found', `skill ${request.skillId} not found in source ${request.source}`)
+      throw new InstallError('skill-not-found', `skill ${skillId} not found in source ${source}`)
     }
     const files = await collectSkillFiles(tar, location.prefix)
     // Staging lives inside the Skills Directory so the final rename is atomic
     // (same filesystem); cleanup on failure leaves zero partial files.
     await mkdir(registryDir(root), { recursive: true })
     const staging = stagingPath(root)
+    const targetPath = join(root, skillId)
     let backup: string | undefined
     try {
       await writeStagedFiles(staging, files)
-      backup = await swapIntoPlace(root, staging, request.skillId)
+      backup = await swapIntoPlace(root, staging, skillId)
     } catch (error) {
       await rm(staging, { recursive: true, force: true })
       throw toInstallError(error)
@@ -382,15 +542,13 @@ export class SkillManager {
     try {
       const contentHash = await hashDirectory(targetPath)
       const pathCommit = await resolvePathCommit(network, ref, location.skillPath, defaultBranch)
-      const record: RegistryRecord = {
-        source: request.source,
-        skillId: request.skillId,
+      const finalRecord: RegistryRecord = {
+        ...record,
         skillPath: location.skillPath,
-        installedAt: new Date().toISOString(),
         commitSha: pathCommit ?? headSha,
         contentHash,
       }
-      await this.recordWriter(root, record)
+      await this.recordWriter(root, finalRecord)
       let warning: string | undefined
       if (backup !== undefined) {
         try {
@@ -398,21 +556,11 @@ export class SkillManager {
         } catch (cleanupError) {
           // Backup cleanup is best-effort: leftover residue is harmless, so a
           // failed removal degrades to a warning — it must never fail (let
-          // alone roll back) an otherwise successful install.
+          // alone roll back) an otherwise successful pipeline run.
           warning = `previous-version backup could not be removed (harmless residue at ${backup}): ${errorMessage(cleanupError)}`
         }
       }
-      return {
-        status: 'installed',
-        action,
-        skillId: request.skillId,
-        source: request.source,
-        targetPath,
-        installedAt: record.installedAt,
-        commitSha: record.commitSha,
-        contentHash,
-        ...(warning !== undefined ? { warning } : {}),
-      }
+      return { record: finalRecord, ...(warning !== undefined ? { warning } : {}) }
     } catch (error) {
       const failure = toInstallError(error)
       try {
@@ -427,9 +575,252 @@ export class SkillManager {
     }
   }
 
+  /** Network handles for the GitHub API / codeload calls (Config-driven bases). */
+  private networkOptions(): InstallNetworkOptions {
+    return {
+      githubApiBase: this.githubApiBase,
+      githubCodeloadBase: this.githubCodeloadBase,
+      fetcher: this.fetcher,
+      binaryFetcher: this.binaryFetcher,
+      timeoutMs: this.installTimeoutMs,
+    }
+  }
+
   /** All Managed Skills (Registry records); the sole authority for "managed". */
   async listInstalled(): Promise<RegistryRecord[]> {
     return listRecords(resolve(this.skillsDir))
+  }
+
+  /**
+   * One user-initiated update check over every Managed Skill: compare each
+   * record's commitSha with the Source's latest default-branch commit
+   * touching skillPath. A 404-class response (repo gone/private/renamed) or a
+   * path with no commits at all marks the record sourceInvalid — persisted,
+   * so the list-installed badge and update()'s refusal need no further
+   * network; a later healthy check clears the flag again (staleness
+   * self-heals). Any other failure (network, rate limit, 5xx) surfaces as a
+   * per-skill retryable `error` and never marks the record invalid. Per-skill
+   * work chains through the same mutation mutex, and the snapshot record only
+   * drives the read-only network check: before a flag is persisted the record
+   * is re-read inside the mutex and only the flag flips on the fresh record —
+   * a concurrent uninstall's removed record is never recreated, and a
+   * concurrent install/update's fresh fields are never overwritten. Network
+   * calls are bounded by the shared fetch semaphore.
+   */
+  async checkUpdates(): Promise<SkillUpdateState[]> {
+    const root = resolve(this.skillsDir)
+    const records = await listRecords(root)
+    return Promise.all(records.map((record) => this.runSerialized(record.skillId, () => this.checkOne(root, record))))
+  }
+
+  /** The per-skill check body; always runs inside that skill's mutex. */
+  private async checkOne(root: string, record: RegistryRecord): Promise<SkillUpdateState> {
+    const state: SkillUpdateState = {
+      skillId: record.skillId,
+      source: record.source,
+      updateAvailable: false,
+      sourceInvalid: record.sourceInvalid === true,
+    }
+    const ref = parseSource(record.source)
+    if (ref === undefined) {
+      // A tampered record whose Source no longer parses can never be checked.
+      await this.persistSourceInvalid(root, record.skillId, true)
+      return { ...state, sourceInvalid: true }
+    }
+    const network = this.networkOptions()
+    let latest: string | undefined
+    try {
+      latest = await this.semaphore.run(() => queryLatestCommit(network, ref, record.skillPath))
+    } catch (error) {
+      if (error instanceof InstallError && (error.status === 404 || error.status === 410)) {
+        await this.persistSourceInvalid(root, record.skillId, true)
+        return { ...state, sourceInvalid: true }
+      }
+      // Transient failure: retryable per-skill error, the flag stays untouched.
+      return { ...state, error: errorMessage(error) }
+    }
+    if (latest === undefined) {
+      // No commit ever touched the path: the Source no longer contains the
+      // Skill (CONTEXT.md Source Invalid).
+      await this.persistSourceInvalid(root, record.skillId, true)
+      return { ...state, sourceInvalid: true }
+    }
+    await this.persistSourceInvalid(root, record.skillId, false)
+    return { ...state, sourceInvalid: false, updateAvailable: latest !== record.commitSha, latestCommitSha: latest }
+  }
+
+  /**
+   * Maintain the record's persisted sourceInvalid flag. The record that
+   * triggered the check is a STALE snapshot by persist time (listed outside
+   * the per-skill mutex), so the record is re-read here — always inside the
+   * mutex, right before the write: a record removed by a concurrent
+   * uninstall is never recreated, and a record replaced by a concurrent
+   * install/update keeps its fresh fields (commitSha, contentHash,
+   * installedAt) — only the flag flips. Best-effort: the check result stands
+   * even when the write fails — update() on a truly dead Source hits the 404
+   * again at resolve time and fails before any write.
+   */
+  private async persistSourceInvalid(root: string, skillId: string, sourceInvalid: boolean): Promise<void> {
+    const current = await readRecord(root, skillId)
+    if (current === undefined) return
+    if ((current.sourceInvalid === true) === sourceInvalid) return
+    const next: RegistryRecord = { ...current }
+    if (sourceInvalid) next.sourceInvalid = true
+    else delete next.sourceInvalid
+    try {
+      await this.recordWriter(root, next)
+    } catch {
+      /* best-effort persist — see docstring */
+    }
+  }
+
+  /**
+   * Update a Managed Skill to its Source's latest default-branch state
+   * (Confirmation-gated). The Registry is the sole authority: no record →
+   * not-managed refusal; a record flagged sourceInvalid → source-invalid
+   * refusal (uninstall stays available). Before the Confirmation gate the
+   * current directory's content hash is recomputed — a mismatch against the
+   * record means local modification, and the confirmation-required response
+   * carries `localModified: true` so the modal can show the overwrite
+   * warning. The gate precedes every network call and write. On confirm the
+   * install pipeline re-runs and the record is refreshed (commitSha,
+   * contentHash, updatedAt; installedAt preserved; sourceInvalid dropped — a
+   * successful update proves the Source healthy). Any failure preserves the
+   * old version AND the Registry unchanged (runPipeline's rollback).
+   */
+  async update(request: ManageRequest): Promise<UpdateResult> {
+    return this.runSerialized(request.skillId, () => this.updateSerialized(request))
+  }
+
+  /** The update body; always runs inside the per-skill mutex. */
+  private async updateSerialized(request: ManageRequest): Promise<UpdateResult> {
+    if (!isValidSkillId(request.skillId)) {
+      throw new InstallError('invalid-input', `invalid skill id: ${JSON.stringify(request.skillId)}`)
+    }
+    const root = resolve(this.skillsDir)
+    const targetPath = join(root, request.skillId)
+    if (targetPath !== root && !targetPath.startsWith(root + sep)) {
+      // Unreachable given the Skill ID grammar; kept as a hard Path Safety gate.
+      throw new InstallError('invalid-input', `target path escapes the skills directory: ${request.skillId}`)
+    }
+    const record = await readRecord(root, request.skillId)
+    if (record === undefined) {
+      throw new InstallError('not-managed', `skill ${request.skillId} is not managed by this plugin`)
+    }
+    if (record.sourceInvalid === true) {
+      throw new InstallError(
+        'source-invalid',
+        `source ${record.source} of skill ${request.skillId} is invalid; update is unavailable`,
+      )
+    }
+    const ref = parseSource(record.source)
+    if (ref === undefined) {
+      // A tampered record whose Source no longer parses can never be updated;
+      // fail closed as source-invalid (uninstall remains available).
+      throw new InstallError('source-invalid', `recorded source is malformed: ${JSON.stringify(record.source)}`)
+    }
+    // Local-modification detection runs BEFORE the Confirmation gate: it is a
+    // pure local read (zero network) and the warning must ride the
+    // confirmation-required response. A missing directory has nothing local
+    // to lose — the pipeline simply recreates it. A hashing failure (an
+    // unreadable directory, or one deleted between the existence probe and
+    // the hash) surfaces as a structured fs InstallError — the client-localizes-
+    // by-code contract — never a bare Error that would become a codeless 500.
+    let localModified = false
+    if (await pathExists(targetPath)) {
+      try {
+        localModified = (await hashDirectory(targetPath)) !== record.contentHash
+      } catch (error) {
+        throw toInstallError(error)
+      }
+    }
+    if (request.confirm !== true) {
+      return {
+        status: 'confirmation-required',
+        action: 'update',
+        skillId: request.skillId,
+        source: record.source,
+        targetPath,
+        ...(localModified ? { localModified: true } : {}),
+      }
+    }
+    const updatedAt = new Date().toISOString()
+    const { record: next, warning } = await this.runPipeline(root, ref, record.source, request.skillId, {
+      source: record.source,
+      skillId: request.skillId,
+      installedAt: record.installedAt,
+      updatedAt,
+    })
+    return {
+      status: 'updated',
+      action: 'update',
+      skillId: request.skillId,
+      source: record.source,
+      targetPath,
+      installedAt: next.installedAt,
+      updatedAt,
+      commitSha: next.commitSha,
+      contentHash: next.contentHash,
+      ...(warning !== undefined ? { warning } : {}),
+    }
+  }
+
+  /**
+   * Uninstall a Managed Skill (Confirmation-gated, zero network). Only
+   * Registry-recorded targets are touched: the skillId is re-validated
+   * against the dsh grammar and the target path resolve-prefix-checked
+   * against the Skills Directory before anything is deleted; a target with
+   * no record is refused with a structured not-managed error — the plugin
+   * never deletes an Unmanaged directory. On confirm the directory is removed
+   * first and the record second, so a record-removal failure self-heals on
+   * retry: a missing directory with an existing record degrades to removing
+   * the record alone (benign).
+   */
+  async uninstall(request: ManageRequest): Promise<UninstallResult> {
+    return this.runSerialized(request.skillId, () => this.uninstallSerialized(request))
+  }
+
+  /** The uninstall body; always runs inside the per-skill mutex. */
+  private async uninstallSerialized(request: ManageRequest): Promise<UninstallResult> {
+    if (!isValidSkillId(request.skillId)) {
+      throw new InstallError('invalid-input', `invalid skill id: ${JSON.stringify(request.skillId)}`)
+    }
+    const root = resolve(this.skillsDir)
+    const targetPath = join(root, request.skillId)
+    if (targetPath !== root && !targetPath.startsWith(root + sep)) {
+      // Unreachable given the Skill ID grammar; kept as a hard Path Safety gate.
+      throw new InstallError('invalid-input', `target path escapes the skills directory: ${request.skillId}`)
+    }
+    const record = await readRecord(root, request.skillId)
+    if (record === undefined) {
+      throw new InstallError(
+        'not-managed',
+        `skill ${request.skillId} is not managed by this plugin; refusing to delete ${targetPath}`,
+      )
+    }
+    if (request.confirm !== true) {
+      return {
+        status: 'confirmation-required',
+        action: 'uninstall',
+        skillId: request.skillId,
+        source: record.source,
+        targetPath,
+      }
+    }
+    const removedDirectory = await pathExists(targetPath)
+    try {
+      if (removedDirectory) await rm(targetPath, { recursive: true })
+      await removeRecord(root, request.skillId)
+    } catch (error) {
+      throw toInstallError(error)
+    }
+    return {
+      status: 'uninstalled',
+      skillId: request.skillId,
+      source: record.source,
+      targetPath,
+      removedDirectory,
+    }
   }
 }
 
