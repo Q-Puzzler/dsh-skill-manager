@@ -3,6 +3,7 @@
 [English](README.md) | 中文
 
 [![许可证](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/Q-Puzzler/dsh-skill-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/Q-Puzzler/dsh-skill-manager/actions/workflows/ci.yml)
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)（dsh）的技能管理插件：在 dsh WebUI 的设置页里浏览、安装、更新和卸载 [skills.sh](https://www.skills.sh/) 上的技能。
 
@@ -18,17 +19,25 @@
 
 ## 安装
 
-需要 [dsh](https://github.com/deepseek-ai/deepseek-harness)，以及 pnpm（已在 pnpm 11.24 上实测）。
+需要 [dsh](https://github.com/deepseek-ai/deepseek-harness)。
+
+```bash
+dsh plugin --profile web add @q-puzzler/dsh-skill-manager
+```
+
+这是推荐路径：npm 包里自带预构建产物，安装时不跑构建脚本，也无需配置 pnpm 的 `allowBuilds`。
+
+装完重启 `dsh web`，强制刷新浏览器页面，然后打开**设置 → Skill Manager**。
+
+### 从 GitHub 源码安装
+
+也可以从 git 源码安装。这条路径需要 pnpm（已在 pnpm 11.24 上实测），并在安装时通过 `prepare` 脚本现场构建 host 和 client 产物：
 
 ```bash
 dsh plugin --profile web add github:Q-Puzzler/dsh-skill-manager
 ```
 
-装完重启 `dsh web`，强制刷新浏览器页面，然后打开**设置 → Skill Manager**。
-
-### pnpm ≥ 10：放行构建脚本
-
-插件在安装时会通过 `prepare` 脚本现场构建 host 和 client 产物，而 pnpm ≥ 10 默认禁止 git 来源的依赖执行构建脚本，所以首次安装会报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`。把报错里 pnpm 打印的**完整 key**（包名加压缩包地址，只写包名不生效）复制到 profile 的 `pnpm-workspace.yaml`（位于 `~/.dsh/profiles/<profile>/`）的 `allowBuilds` 段里：
+pnpm ≥ 10 默认禁止 git 来源的依赖执行构建脚本，所以首次安装会报 `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`。把报错里 pnpm 打印的**完整 key**（包名加压缩包地址，只写包名不生效）复制到 profile 的 `pnpm-workspace.yaml`（位于 `~/.dsh/profiles/<profile>/`）的 `allowBuilds` 段里：
 
 ```yaml
 allowBuilds:
