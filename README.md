@@ -3,6 +3,7 @@
 English | [中文](README.zh.md)
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![CI](https://github.com/Q-Puzzler/dsh-skill-manager/actions/workflows/ci.yml/badge.svg)](https://github.com/Q-Puzzler/dsh-skill-manager/actions/workflows/ci.yml)
 
 A skill manager for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh): browse, install, update and uninstall [skills.sh](https://www.skills.sh/) skills from a dedicated page in the dsh WebUI settings.
 
@@ -18,17 +19,25 @@ A skill manager for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-h
 
 ## Installation
 
-Requires [dsh](https://github.com/deepseek-ai/deepseek-harness) and pnpm on your PATH (tested with pnpm 11.24).
+Requires [dsh](https://github.com/deepseek-ai/deepseek-harness).
+
+```bash
+dsh plugin --profile web add @q-puzzler/dsh-skill-manager
+```
+
+This is the recommended path: the npm package ships prebuilt bundles, so there is no install-time build and no pnpm `allowBuilds` entry to manage.
+
+Then restart `dsh web`, hard-refresh the browser, and open **Settings → Skill Manager**.
+
+### Install from GitHub source
+
+Alternatively, install from the git source. This path requires pnpm on your PATH (tested with pnpm 11.24) and builds the host and client bundles at install time via a `prepare` script:
 
 ```bash
 dsh plugin --profile web add github:Q-Puzzler/dsh-skill-manager
 ```
 
-Then restart `dsh web`, hard-refresh the browser, and open **Settings → Skill Manager**.
-
-### pnpm ≥ 10: allow the build script
-
-The plugin builds its host and client bundles at install time via a `prepare` script. pnpm ≥ 10 blocks build scripts of git-hosted dependencies by default, so the first install fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`. Copy the **full key** pnpm prints (package name plus codeload tarball URL — the bare package name alone does not work) into the `allowBuilds` section of the profile's `pnpm-workspace.yaml` (at `~/.dsh/profiles/<profile>/`):
+pnpm ≥ 10 blocks build scripts of git-hosted dependencies by default, so the first install fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`. Copy the **full key** pnpm prints (package name plus codeload tarball URL — the bare package name alone does not work) into the `allowBuilds` section of the profile's `pnpm-workspace.yaml` (at `~/.dsh/profiles/<profile>/`):
 
 ```yaml
 allowBuilds:
