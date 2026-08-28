@@ -1,5 +1,11 @@
 name: Release
 
+# Prerequisites on the npm side (one-time, manual): the package must already
+# exist on npm (publish the first version locally with `pnpm publish --access
+# public`), then register this repository + this workflow's filename as a
+# Trusted Publisher in the package settings on npmjs.com. OIDC provenance is
+# sufficient — do NOT add an NPM_TOKEN secret.
+
 on:
   push:
     tags: ['v*']
@@ -23,7 +29,9 @@ jobs:
           registry-url: https://registry.npmjs.org
 
       - name: Upgrade npm for trusted publishing
-        run: npm install -g npm@latest
+        # Pin the major: trusted publishing needs npm >= 11.5.1, and a pinned
+        # toolchain keeps every release reproducible.
+        run: npm install -g npm@11
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
