@@ -1,61 +1,63 @@
 # dsh-skill-manager
 
-A DeepSeek Harness (dsh) plugin for browsing, installing, updating and uninstalling skills from the [skills.sh](https://www.skills.sh/) Catalog, with a dedicated entry in the dsh WebUI settings.
+English | [中文](README.zh.md)
 
-Tested against dsh **0.1.1-rc.2** (dsh 0.1.x is a preview series with no semver guarantees).
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+A skill manager for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) (dsh): browse, install, update and uninstall [skills.sh](https://www.skills.sh/) skills from a dedicated page in the dsh WebUI settings.
+
+> Tested against dsh **0.1.1-rc.2**. dsh 0.1.x is a developer preview with no semver guarantees.
 
 ## Features
 
-- **Search & browse the Catalog** — keyword search from the settings page; each result shows the skill name, install count, a lazily loaded description (from the Source's `SKILL.md` frontmatter), and a link to its skills.sh page.
-- **Install** — one-click install into the dsh Skills Directory (`~/.dsh/skills`), discovered by dsh without a restart. Already-managed skills show as installed; reinstalling a Managed Skill and overwriting an Unmanaged same-named directory both require an explicit two-phase Confirmation.
-- **Manage installed skills** — list of Managed Skills (name, Source, install time), one-click update checks against the Source's latest commit, update and uninstall (both behind Confirmation). Skills with a newer upstream commit carry an **Update Available** badge; skills whose Source is gone or no longer contains them carry a **Source Invalid** badge (local copy keeps working, updates disabled, uninstall still allowed).
-- **Local modification warning** — if you edited a Managed Skill's files, the update Confirmation warns that your changes will be overwritten.
-- **Path safety** — every write is confined to the Skills Directory, enforced on the host side: Skill IDs are validated against the dsh name grammar and Source segments against GitHub's owner/repo rules, tarball entries are filtered (no path traversal, absolute paths, or symlinks), and the plugin never touches directories it does not manage.
+- **Search & browse** — keyword search of the skills.sh Catalog; each result shows the name, install count, a lazily loaded description, and a link to its skills.sh page.
+- **One-click install** — skills land in the dsh Skills Directory (`~/.dsh/skills`), discovered by dsh without a restart. Skills from other sources sharing the same name are distinguished by Source + name, never mismarked as installed.
+- **Update management** — one-click update checks against the Source's latest commit, with three clear states per skill: **Update Available**, **Up to date**, and **Source Invalid** (the local copy keeps working; updates are disabled, uninstall stays available).
+- **Confirmation before mutation** — reinstalls, overwrites, updates and uninstalls all require explicit confirmation; if an update would overwrite files you edited locally, the confirmation says so first.
+- **Path safety** — every write is confined to the Skills Directory, enforced host-side: Skill IDs are validated against the dsh name grammar, Source segments against GitHub's owner/repo rules, tarball entries are filtered (no path traversal, absolute paths, or symlinks), and directories the plugin does not manage are never touched.
 
 ## Installation
 
-From a GitHub source (example uses the `web` profile — substitute your target profile name):
+Requires [dsh](https://github.com/deepseek-ai/deepseek-harness) and pnpm on your PATH (tested with pnpm 11.24).
 
 ```bash
 dsh plugin --profile web add github:Q-Puzzler/dsh-skill-manager
 ```
 
-`dsh plugin add` delegates to pnpm inside the profile directory, so pnpm must be available on your PATH (tested with pnpm 11.24).
+Then restart `dsh web`, hard-refresh the browser, and open **Settings → Skill Manager**.
 
-### Prerequisite: pnpm allowBuilds (pnpm ≥ 10)
+### pnpm ≥ 10: allow the build script
 
-The repository builds its host and client bundles at install time via a self-contained `prepare` script. pnpm ≥ 10 blocks build scripts of git-hosted dependencies by default, so the first install fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`:
-
-```
-The git-hosted package "@q-puzzler/dsh-skill-manager@<version>" needs to execute build scripts
-but is not in the "allowBuilds" allowlist.
-
-Add the package to "allowBuilds" in your project's pnpm-workspace.yaml to allow it to run scripts.
-For example:
-allowBuilds:
-  @q-puzzler/dsh-skill-manager@https://codeload.github.com/Q-Puzzler/dsh-skill-manager/tar.gz/<commit-sha>: true
-```
-
-Copy the **full key** pnpm prints (package name plus codeload tarball URL — the bare package name alone does not work) into the `allowBuilds` section of the profile's `pnpm-workspace.yaml` (at `~/.dsh/profiles/<profile>/`), then re-run the same `add` command:
+The plugin builds its host and client bundles at install time via a `prepare` script. pnpm ≥ 10 blocks build scripts of git-hosted dependencies by default, so the first install fails with `ERR_PNPM_GIT_DEP_PREPARE_NOT_ALLOWED`. Copy the **full key** pnpm prints (package name plus codeload tarball URL — the bare package name alone does not work) into the `allowBuilds` section of the profile's `pnpm-workspace.yaml` (at `~/.dsh/profiles/<profile>/`):
 
 ```yaml
 allowBuilds:
   '@q-puzzler/dsh-skill-manager@https://codeload.github.com/Q-Puzzler/dsh-skill-manager/tar.gz/<commit-sha>': true
 ```
 
-Note: the URL embeds a commit SHA, so the key changes with every new commit of the plugin. When an install or upgrade fails again, just copy the new key from pnpm's error message the same way.
+Then re-run the same `add` command.
 
-### Verify
+> The key embeds a commit SHA, so it changes with every new commit of the plugin. When an install or upgrade fails again, copy the new key from pnpm's error message the same way.
+
+### Verify the installation
 
 ```bash
 dsh --profile web --dump-config
 ```
 
-The output should contain a `skill-manager` layer (`# == @q-puzzler/dsh-skill-manager` and `- id: skill-manager`). Then restart `dsh web` and hard-refresh the browser — a **Skill Manager** section appears in the settings sidebar. The client bundle is served at `/plugins/@q-puzzler/dsh-skill-manager/client.js`.
+The output should contain a `skill-manager` layer (`# == @q-puzzler/dsh-skill-manager` and `- id: skill-manager`).
+
+## Usage
+
+Everything happens in the dsh WebUI under **Settings → Skill Manager**:
+
+- **Search** skills by keyword; follow a result's link to its skills.sh page.
+- **Install** from the results list. Already-managed skills show as installed; reinstalling one, or overwriting an unmanaged same-named directory, asks for confirmation first.
+- **Manage** the installed list: check updates for everything at once, then update or uninstall individual skills — always behind a confirmation dialog.
 
 ## Runtime requirements & expected warnings
 
-- **WebUI profile required.** This plugin's entire surface lives in the dsh WebUI (host routes on the `webServer` service, a settings section in the client), so install it into a profile that provides `webServer` — e.g. the `web` profile. Installing it into a profile **without** a WebUI is harmless: the plugin activates but stays idle (no routes registered, nothing mounted), the profile boots normally, and the host log carries one warning that `webServer` is unavailable and the plugin requires a WebUI-enabled profile.
+- **WebUI profile required.** This plugin's entire surface lives in the dsh WebUI (host routes on the `webServer` service, a settings section in the client), so install it into a profile that provides `webServer` — e.g. the `web` profile. Installing into a profile **without** a WebUI is harmless: the plugin stays idle (no routes registered, nothing mounted), the profile boots normally, and the host log carries one warning explaining why.
 - **Expected pnpm peer warnings.** During install pnpm may print `missing peer` warnings for `@deepseek-ai/cordis` and the `@deepseek-ai/dsh-client-*` packages. These are expected and safe to ignore: they are declared as peer dependencies because dsh supplies them at runtime through its own module graph — they must not be installed into the plugin itself.
 
 ## Development
